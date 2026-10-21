@@ -36,6 +36,8 @@ pub const USER_SLOT: &str = "user";
 /// Policy Playground sends when a manifest has no `duration_s`
 /// (`pollen-robotics/microduck-policy-playground`, "held for 3s").
 pub const DEFAULT_DURATION_S: f64 = 3.0;
+/// The shortest a call may ask a skill to run.
+pub const MIN_DURATION_S: f64 = 0.1;
 /// The longest a call may ask a skill to run.
 pub const MAX_DURATION_S: f64 = 60.0;
 /// The largest policy accepted. The official set's are under 1 MB.
@@ -70,6 +72,15 @@ const LOST_AFTER: Duration = Duration::from_secs(10);
 /// robot that is homing (another reload in flight) before calling robotd
 /// anyway. See [`LOST_AFTER`] for why they wait.
 pub const SETTLE_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long a pending install may read `homing` before it is an
+/// `error`: homing measures about two seconds, and a robot that is not
+/// started (torque off, robotd's `Limp` bring-up) answers `homed: false`
+/// for as long as nobody presses Start.
+pub const HOMING_LIMIT: Duration = Duration::from_secs(15);
+/// The `detail` of that error.
+pub const NOT_HOME: &str = "not at its home pose — is it started?";
+/// The most redirects a download follows (the Hub uses one or two).
+const MAX_REDIRECTS: u32 = 5;
 
 pub const DOWNLOAD_FAILED: &str = "install: download failed";
 pub const NOT_ONNX: &str = "install: not an onnx file";
@@ -110,7 +121,7 @@ impl Request {
         let duration_s = match args.get("duration_s") {
             None | Some(Value::Null) => DEFAULT_DURATION_S,
             Some(value) => match value.as_f64() {
-                Some(d) if d > 0.0 && d <= MAX_DURATION_S => d,
+                Some(d) if (MIN_DURATION_S..=MAX_DURATION_S).contains(&d) => d,
                 _ => return Err(SLOT_REFUSED),
             },
         };
@@ -229,8 +240,8 @@ fn change_error(policies: &Value) -> Option<String> {
 /// robotd lists the configured skills by name (`skills`) and says
 /// whether the robot is at its home pose (`homed`, `None` from a robot
 /// too old to say). A listed skill is `homed` once the robot is,
-/// `homing` until then; one that is not listed is `missing`, or `error`
-/// when robotd reports a failed change. Anything unreadable is `error`.
+/// `homing` until then; one that is not listed is `missing`. Anything
+/// unreadable is `error`.
 pub fn state_of(policies: &Value, name: &str) -> &'static str {
     status(policies, name, None).0
 }
@@ -252,6 +263,14 @@ pub fn status(policies: &Value, name: &str, pending: Option<&mut Pending>) -> (&
         && homed == Some(false)
     {
         p.seen_homing = true;
+    }
+    // A pending install that has been homing far longer than a reload
+    // takes is on a robot that is not going to get there by itself.
+    if let Some(p) = pending.as_deref()
+        && homed == Some(false)
+        && p.since.elapsed() >= HOMING_LIMIT
+    {
+        return ("error", Some(NOT_HOME.to_string()));
     }
     if listed {
         return match homed {
@@ -275,12 +294,13 @@ pub fn status(policies: &Value, name: &str, pending: Option<&mut Pending>) -> (&
         (Some(p), Some(error)) if p.change_error.as_deref() != Some(error.as_str()) => {
             ("error", Some(one_line(&error)))
         }
-        (None, Some(error)) => ("error", Some(one_line(&error))),
         (Some(p), _) if p.seen_homing && homed == Some(true) && p.since.elapsed() >= LOST_AFTER => {
             ("error", Some("the robot homed without loading it; install it again".to_string()))
         }
         (Some(_), _) => ("homing", None),
-        (None, None) => ("missing", None),
+        // Not this name's install: robotd's `change_error` is about
+        // whatever change it was, so it is not reported here.
+        (None, _) => ("missing", None),
     }
 }
 
@@ -310,20 +330,57 @@ pub fn target(dir: &Path, name: &str, file: &str) -> PathBuf {
     dir.join(name).join(file)
 }
 
+/// Whether a download may end at `host`: the two allowlisted hosts, and
+/// the Hub's CDNs, which move between `cdn-lfs.huggingface.co`,
+/// `cdn-lfs*.hf.co` and `cas-bridge.xethub.hf.co`.
+pub fn final_host_ok(host: &str) -> bool {
+    HOSTS.contains(&host) || host.ends_with(".huggingface.co") || host.ends_with(".hf.co")
+}
+
+/// What a download may do on the way: in production, https only and an
+/// allowlisted final host; the loopback tests relax both.
+pub(crate) struct Policy {
+    https_only: bool,
+    /// Final hosts accepted besides [`final_host_ok`]'s.
+    also: &'static [&'static str],
+}
+
+const PRODUCTION: Policy = Policy { https_only: true, also: &[] };
+
 /// Download `url` to `dir/<name>/<file>` with the size cap and the magic
-/// check. Returns the path and the bytes written.
+/// check, over https only, at most five redirects, and only when the
+/// last hop is still an allowlisted host. Returns the path and the bytes
+/// written.
 pub fn fetch_to(dir: &Path, name: &str, file: &str, url: &str) -> Result<(PathBuf, u64), &'static str> {
+    fetch_with(dir, name, file, url, &PRODUCTION)
+}
+
+pub(crate) fn fetch_with(
+    dir: &Path,
+    name: &str,
+    file: &str,
+    url: &str,
+    policy: &Policy,
+) -> Result<(PathBuf, u64), &'static str> {
+    use ureq::ResponseExt as _;
     let started = Instant::now();
     let path = target(dir, name, file);
     let folder = path.parent().ok_or(DOWNLOAD_FAILED)?;
     let agent: ureq::Agent = ureq::Agent::config_builder()
         .timeout_global(Some(DOWNLOAD_TIMEOUT))
+        .https_only(policy.https_only)
+        .max_redirects(MAX_REDIRECTS)
         .build()
         .into();
     let response = agent.get(url).call().map_err(|error| {
         tracing::info!(name, error = %kind_of(&error), "policy download failed");
         DOWNLOAD_FAILED
     })?;
+    let host = response.get_uri().host().unwrap_or("");
+    if !(final_host_ok(host) || policy.also.contains(&host)) {
+        tracing::info!(name, "policy download failed: redirect off-list");
+        return Err(DOWNLOAD_FAILED);
+    }
     let declared = response
         .headers()
         .get("content-length")
@@ -478,6 +535,7 @@ pub(crate) mod tests {
             json!({"source": "org/repo", "name": "bow", "slot": "walk"}),
             json!({"source": "org/repo", "name": "bow", "file": "../x.onnx"}),
             json!({"source": "org/repo", "name": "bow", "duration_s": 0}),
+            json!({"source": "org/repo", "name": "bow", "duration_s": 0.05}),
             json!({"source": "org/repo", "name": "bow", "duration_s": 600}),
             json!({"source": "org/repo", "name": "bow", "duration_s": "3"}),
             json!({"source": "org/repo", "name": "bow", "chain": "maybe"}),
@@ -501,8 +559,11 @@ pub(crate) mod tests {
         let homing = json!({"skills": ["flamingo_cycle"], "homed": false});
         assert_eq!(state_of(&homing, "flamingo_cycle"), "homing");
         let failed = json!({"skills": [], "homed": true, "change_error": "no such file: /var/lib/x.onnx"});
-        assert_eq!(state_of(&failed, "flamingo_cycle"), "error");
-        let (_, detail) = status(&failed, "flamingo_cycle", None);
+        // Somebody else's failed change is not this name's error.
+        assert_eq!(status(&failed, "flamingo_cycle", None), ("missing", None));
+        let mut pending = Pending::before("flamingo_cycle", &homed);
+        let (state, detail) = status(&failed, "flamingo_cycle", Some(&mut pending));
+        assert_eq!(state, "error");
         assert_eq!(detail.unwrap(), "no such file: <path>");
         assert_eq!(state_of(&json!([1, 2]), "x"), "error");
         assert_eq!(state_of(&json!({"skills": "x"}), "x"), "error");
@@ -548,6 +609,62 @@ pub(crate) mod tests {
         assert_eq!(status(&before, "flamingo_cycle", Some(&mut pending)).0, "homed");
     }
 
+    /// Plain http to 127.0.0.1, for the loopback servers below.
+    pub(crate) const LOOPBACK: Policy = Policy { https_only: false, also: &["127.0.0.1"] };
+
+    #[test]
+    fn the_final_host_must_be_the_hub_or_gcs() {
+        for host in ["huggingface.co", "cdn-lfs.huggingface.co", "cas-bridge.xethub.hf.co", "storage.googleapis.com"] {
+            assert!(final_host_ok(host), "{host}");
+        }
+        for host in ["evil.example", "huggingface.co.evil.example", "hf.co.evil", "localhost", "192.168.1.2", ""] {
+            assert!(!final_host_ok(host), "{host}");
+        }
+    }
+
+    #[test]
+    fn a_redirect_off_the_list_is_a_failed_download() {
+        let dir = tempfile::tempdir().unwrap();
+        // The second hop is still loopback, but named `localhost`: off-list.
+        let body = vec![0x08, 1, 2, 3];
+        let (target_url, target) = serve(ok_head(body.len()), body);
+        let location = target_url.replace("127.0.0.1", "localhost");
+        let head: &'static str = Box::leak(
+            format!("HTTP/1.1 302 Found\r\nLocation: {location}\r\nContent-Length: 0").into_boxed_str(),
+        );
+        let (url, first) = serve(head, Vec::new());
+        assert_eq!(fetch_with(dir.path(), "bounced", "policy.onnx", &url, &LOOPBACK).unwrap_err(), DOWNLOAD_FAILED);
+        first.join().unwrap();
+        drop(target); // whether ureq reached it depends on how localhost resolves
+        assert!(!dir.path().join("bounced").exists());
+        // And production refuses plain http outright.
+        let (url, server) = serve(ok_head(4), vec![0x08, 1, 2, 3]);
+        assert_eq!(fetch_to(dir.path(), "plain", "policy.onnx", &url).unwrap_err(), DOWNLOAD_FAILED);
+        drop(server); // never connected to
+    }
+
+    #[test]
+    fn a_failed_rename_leaves_no_part_file() {
+        let dir = tempfile::tempdir().unwrap();
+        // A non-empty directory where the file should go: rename fails.
+        std::fs::create_dir_all(dir.path().join("blocked/policy.onnx/x")).unwrap();
+        let (url, server) = serve(ok_head(4), vec![0x08, 1, 2, 3]);
+        assert_eq!(fetch_with(dir.path(), "blocked", "policy.onnx", &url, &LOOPBACK).unwrap_err(), DOWNLOAD_FAILED);
+        server.join().unwrap();
+        assert!(!dir.path().join("blocked/policy.onnx.part").exists());
+    }
+
+    #[test]
+    fn a_limp_robot_turns_a_pending_install_into_an_error() {
+        let limp = json!({"skills": [], "homed": false});
+        let mut pending = Pending::before("flamingo_cycle", &limp);
+        assert_eq!(status(&limp, "flamingo_cycle", Some(&mut pending)).0, "homing");
+        pending.since -= HOMING_LIMIT;
+        assert_eq!(status(&limp, "flamingo_cycle", Some(&mut pending)), ("error", Some(NOT_HOME.to_string())));
+        let listed = json!({"skills": ["flamingo_cycle"], "homed": false});
+        assert_eq!(status(&listed, "flamingo_cycle", Some(&mut pending)).0, "error");
+    }
+
     /// A one-shot HTTP server on loopback answering with `head` (status
     /// line and headers, without the blank line) and `body`.
     pub(crate) fn serve(head: &'static str, body: Vec<u8>) -> (String, std::thread::JoinHandle<()>) {
@@ -579,7 +696,7 @@ pub(crate) mod tests {
         let dir = tempfile::tempdir().unwrap();
         let body = vec![0x08, 0x08, 0x12, 0x07];
         let (url, server) = serve(ok_head(body.len()), body.clone());
-        let (path, bytes) = fetch_to(dir.path(), "flamingo_cycle", "policy.onnx", &url).unwrap();
+        let (path, bytes) = fetch_with(dir.path(), "flamingo_cycle", "policy.onnx", &url, &LOOPBACK).unwrap();
         server.join().unwrap();
         assert_eq!(bytes, 4);
         assert_eq!(path, dir.path().join("flamingo_cycle/policy.onnx"));
@@ -587,16 +704,16 @@ pub(crate) mod tests {
         assert!(!dir.path().join("flamingo_cycle/policy.onnx.part").exists());
 
         let (url, server) = serve(ok_head(15), b"<!doctype html>".to_vec());
-        assert_eq!(fetch_to(dir.path(), "html_page", "policy.onnx", &url).unwrap_err(), NOT_ONNX);
+        assert_eq!(fetch_with(dir.path(), "html_page", "policy.onnx", &url, &LOOPBACK).unwrap_err(), NOT_ONNX);
         server.join().unwrap();
         assert!(!dir.path().join("html_page").exists());
 
         let (url, server) = serve("HTTP/1.1 200 OK\r\nContent-Length: 30000000", Vec::new());
-        assert_eq!(fetch_to(dir.path(), "huge", "policy.onnx", &url).unwrap_err(), TOO_LARGE);
+        assert_eq!(fetch_with(dir.path(), "huge", "policy.onnx", &url, &LOOPBACK).unwrap_err(), TOO_LARGE);
         server.join().unwrap();
 
         let (url, server) = serve("HTTP/1.1 404 Not Found\r\nContent-Length: 0", Vec::new());
-        assert_eq!(fetch_to(dir.path(), "gone", "policy.onnx", &url).unwrap_err(), DOWNLOAD_FAILED);
+        assert_eq!(fetch_with(dir.path(), "gone", "policy.onnx", &url, &LOOPBACK).unwrap_err(), DOWNLOAD_FAILED);
         server.join().unwrap();
     }
 
@@ -606,7 +723,7 @@ pub(crate) mod tests {
         let mut body = vec![0u8; (MAX_BYTES + 10) as usize];
         body[0] = 0x08;
         let (url, server) = serve("HTTP/1.1 200 OK", body);
-        assert_eq!(fetch_to(dir.path(), "huge", "policy.onnx", &url).unwrap_err(), TOO_LARGE);
+        assert_eq!(fetch_with(dir.path(), "huge", "policy.onnx", &url, &LOOPBACK).unwrap_err(), TOO_LARGE);
         server.join().unwrap();
         assert!(!dir.path().join("huge").exists());
     }

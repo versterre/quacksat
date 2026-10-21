@@ -99,6 +99,9 @@ pub struct Robot {
     pub install_dir: std::path::PathBuf,
     /// The install `robot.policy_status` is following, if any.
     pub pending_install: Option<crate::install::Pending>,
+    /// When this satellite last changed robotd's skill table: the only
+    /// homing worth waiting for before the next change (see [`settled`]).
+    pub last_change: Option<std::time::Instant>,
 }
 
 impl Robot {
@@ -117,6 +120,7 @@ impl Robot {
             camera: config.camera.frame_socket.clone(),
             install_dir: config.install.dir.clone().into(),
             pending_install: None,
+            last_change: None,
         }
     }
 
@@ -145,6 +149,7 @@ impl Robot {
             camera: String::new(),
             install_dir: crate::install::DEFAULT_DIR.into(),
             pending_install: None,
+            last_change: None,
         }
     }
 }
@@ -263,7 +268,7 @@ pub fn catalog(robot: &Robot) -> Value {
                 "file": {"type": "string", "description": "the .onnx in the repo, default policy.onnx"},
                 "name": {"type": "string", "description": "the skill's name: lowercase letters, digits, _"},
                 "slot": {"type": "string", "enum": ["user"]},
-                "duration_s": {"type": "number", "description": "seconds it runs, default 3", "minimum": 0.1, "maximum": crate::install::MAX_DURATION_S},
+                "duration_s": {"type": "number", "description": "seconds it runs, default 3", "minimum": crate::install::MIN_DURATION_S, "maximum": crate::install::MAX_DURATION_S},
                 "chain": {"type": "string", "enum": ["true", "false"], "description": "whether a request while it runs queues another"}
             },
             "required": ["source", "name"]
@@ -427,20 +432,27 @@ pub fn execute(name: &str, args: &Value, robot: &mut Robot) -> Result<Value, Str
 /// refusal is one of [`crate::install`]'s fixed lines.
 fn install_policy(args: &Value, robot: &mut Robot) -> Result<Value, String> {
     let request = crate::install::Request::parse(args).map_err(str::to_string)?;
-    install_with(request, robot)
+    install_with(request, robot, crate::install::fetch_to)
 }
+
+/// How [`install_with`] downloads: [`crate::install::fetch_to`] in
+/// production, a loopback-friendly one in the tests.
+type Fetch = fn(&std::path::Path, &str, &str, &str) -> Result<(std::path::PathBuf, u64), &'static str>;
 
 /// [`install_policy`] once the request is checked: split out so a test
 /// can point `url` at a loopback server.
-fn install_with(request: crate::install::Request, robot: &mut Robot) -> Result<Value, String> {
+fn install_with(request: crate::install::Request, robot: &mut Robot, fetch: Fetch) -> Result<Value, String> {
     use crate::install::{self, ROBOT_UNAVAILABLE, SET_SKILL_REFUSED};
     // The robot first: no point fetching 20 MB for a duck that is not there.
     robot.redial();
     policies(&mut robot.lane.control)?;
     let (path, bytes) =
-        install::fetch_to(&robot.install_dir, &request.name, &request.file, &request.url)
-            .map_err(str::to_string)?;
-    let before = settled(&mut robot.lane.control)?;
+        fetch(&robot.install_dir, &request.name, &request.file, &request.url).map_err(str::to_string)?;
+    let before = settled(&mut robot.lane.control, robot.last_change)?;
+    let new_name = !before
+        .get("skills")
+        .and_then(Value::as_array)
+        .is_some_and(|skills| skills.iter().any(|s| s.as_str() == Some(request.name.as_str())));
     let params = proto::SkillParams {
         name: request.name.clone(),
         path: Some(path.to_string_lossy().into_owned()),
@@ -455,8 +467,13 @@ fn install_with(request: crate::install::Request, robot: &mut Robot) -> Result<V
             .is_ok_and(|result| result.accepted);
     if !accepted {
         tracing::info!(name = %request.name, "robotd refused the skill");
+        if new_name {
+            // Nothing refers to these files: don't leave them behind.
+            install::remove_files(&robot.install_dir, &request.name);
+        }
         return Err(SET_SKILL_REFUSED.to_string());
     }
+    robot.last_change = Some(std::time::Instant::now());
     tracing::info!(name = %request.name, bytes, "skill installed, robot homing");
     robot.pending_install = Some(install::Pending::before(&request.name, &before));
     Ok(install::installed(&request.name, bytes))
@@ -490,7 +507,7 @@ fn remove_policy(args: &Value, robot: &mut Robot) -> Result<Value, String> {
     let name = args.get("name").and_then(Value::as_str).ok_or(SLOT_REFUSED)?;
     crate::install::validate_name(name)?;
     robot.redial();
-    settled(&mut robot.lane.control)?;
+    settled(&mut robot.lane.control, robot.last_change)?;
     let call = proto::Call::RobotRemoveSkill(proto::SkillNameParams { name: name.to_string() });
     let response = request_or(&mut robot.lane.control, &call, ROBOT_UNAVAILABLE)?;
     let result = response
@@ -502,6 +519,9 @@ fn remove_policy(args: &Value, robot: &mut Robot) -> Result<Value, String> {
         .ok_or(REMOVE_REFUSED)?;
     // `already` (nothing configured by that name) carries a reason.
     let removed = result.reason.is_none();
+    if removed {
+        robot.last_change = Some(std::time::Instant::now());
+    }
     crate::install::remove_files(&robot.install_dir, name);
     if robot.pending_install.as_ref().is_some_and(|p| p.name == name) {
         robot.pending_install = None;
@@ -521,13 +541,19 @@ fn policies(control: &mut Option<Control>) -> Result<Value, String> {
     response.result.ok_or_else(|| unavailable.to_string())
 }
 
-/// `robot.policies` once the robot is not homing, or after
-/// [`crate::install::SETTLE_TIMEOUT`] regardless: robotd drops a skill
-/// change that arrives while another change's reload is in flight (an
-/// install right after a remove, measured on the sim 2026-10-21), and
-/// `homed: false` is how that reload shows.
-fn settled(control: &mut Option<Control>) -> Result<Value, String> {
-    let deadline = std::time::Instant::now() + crate::install::SETTLE_TIMEOUT;
+/// `robot.policies`, once a reload this satellite triggered is done.
+///
+/// robotd drops a skill change that arrives while another change's
+/// reload is in flight (an install right after a remove, measured on the
+/// sim 2026-10-21), and `homed: false` is how that reload shows. So
+/// within [`crate::install::SETTLE_TIMEOUT`] of our own last change this
+/// waits for `homed`; otherwise it does not wait at all — a robot that is
+/// simply not started (torque off) answers `homed: false` for good, and
+/// no change of ours is in flight there.
+fn settled(control: &mut Option<Control>, last_change: Option<std::time::Instant>) -> Result<Value, String> {
+    let deadline = last_change
+        .map(|at| at + crate::install::SETTLE_TIMEOUT)
+        .unwrap_or_else(std::time::Instant::now);
     loop {
         let answer = policies(control)?;
         let homing = answer.get("homed").and_then(Value::as_bool) == Some(false);
@@ -854,6 +880,18 @@ mod tests {
         (dir, robot, server)
     }
 
+    fn install_with_loopback(request: crate::install::Request, robot: &mut Robot) -> Result<Value, String> {
+        fn fetch(
+            dir: &std::path::Path,
+            name: &str,
+            file: &str,
+            url: &str,
+        ) -> Result<(std::path::PathBuf, u64), &'static str> {
+            crate::install::fetch_with(dir, name, file, url, &crate::install::tests::LOOPBACK)
+        }
+        install_with(request, robot, fetch)
+    }
+
     fn request_for(name: &str, url: String) -> crate::install::Request {
         let mut request =
             crate::install::Request::parse(&json!({"source": "org/repo", "name": name})).unwrap();
@@ -911,7 +949,7 @@ mod tests {
         });
         let body = vec![0x08, 0x08, 0x12, 0x07];
         let (url, http) = serve(ok_head(body.len()), body.clone());
-        let answer = install_with(request_for("flamingo_cycle", url), &mut robot).unwrap();
+        let answer = install_with_loopback(request_for("flamingo_cycle", url), &mut robot).unwrap();
         http.join().unwrap();
         assert_eq!(answer, json!({"name": "flamingo_cycle", "bytes": 4, "stage": "installing"}));
         let landed = dir.path().join("policies/flamingo_cycle/policy.onnx");
@@ -950,17 +988,19 @@ mod tests {
         });
         let (url, http) = serve(ok_head(4), vec![0x08, 1, 2, 3]);
         assert_eq!(
-            install_with(request_for("bow", url), &mut robot),
+            install_with_loopback(request_for("bow", url), &mut robot),
             Err("install: setSkill refused".to_string())
         );
         http.join().unwrap();
         assert!(robot.pending_install.is_none());
+        // A new name robotd refused leaves nothing on disk.
+        assert!(!robot.install_dir.join("bow").exists());
 
         let (url, http) = serve(ok_head(15), b"<!doctype html>".to_vec());
-        assert_eq!(install_with(request_for("bow", url), &mut robot), Err("install: not an onnx file".to_string()));
+        assert_eq!(install_with_loopback(request_for("bow", url), &mut robot), Err("install: not an onnx file".to_string()));
         http.join().unwrap();
         let (url, http) = serve("HTTP/1.1 200 OK\r\nContent-Length: 30000000", Vec::new());
-        assert_eq!(install_with(request_for("bow", url), &mut robot), Err("install: too large".to_string()));
+        assert_eq!(install_with_loopback(request_for("bow", url), &mut robot), Err("install: too large".to_string()));
         http.join().unwrap();
         drop(robot);
         let seen = server.join().unwrap();
@@ -988,6 +1028,55 @@ mod tests {
         let seen = server.join().unwrap();
         let remove = seen.iter().find(|r| r.method == "robot.removeSkill").unwrap();
         assert_eq!(remove.params.clone().unwrap(), json!({"name": "flamingo_cycle"}));
+    }
+
+    #[test]
+    fn a_robot_that_is_not_started_neither_stalls_nor_homes_forever() {
+        use crate::install::tests::{ok_head, serve};
+
+        // Torque off: `homed: false` on every answer, forever.
+        let (_dir, mut robot, server) = fake_robotd(|request| match request.method.as_str() {
+            "robot.policies" => json!({"skills": [], "homed": false}),
+            "robot.setSkill" => json!({"accepted": true}),
+            other => panic!("unexpected {other}"),
+        });
+        let (url, http) = serve(ok_head(4), vec![0x08, 1, 2, 3]);
+        let started = std::time::Instant::now();
+        install_with_loopback(request_for("bow", url), &mut robot).unwrap();
+        http.join().unwrap();
+        // No change of ours was in flight, so no settle wait.
+        assert!(started.elapsed() < std::time::Duration::from_secs(2), "{:?}", started.elapsed());
+        let status = execute("robot.policy_status", &json!({"name": "bow"}), &mut robot).unwrap();
+        assert_eq!(status["state"], "homing");
+        robot.pending_install.as_mut().unwrap().since -= crate::install::HOMING_LIMIT;
+        let status = execute("robot.policy_status", &json!({"name": "bow"}), &mut robot).unwrap();
+        assert_eq!(status, json!({"name": "bow", "state": "error", "detail": crate::install::NOT_HOME}));
+        drop(robot);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn remove_policy_reports_nothing_to_remove_and_refusals() {
+        let (_dir, mut robot, server) = fake_robotd(|request| match request.method.as_str() {
+            "robot.policies" => json!({"skills": [], "homed": true}),
+            "robot.removeSkill" => match request.params.as_ref().unwrap()["name"].as_str() {
+                Some("never_here") => json!({"accepted": true, "reason": "no configured skill called \"never_here\""}),
+                _ => json!({"accepted": false, "reason": "nope"}),
+            },
+            "robot.skills" => json!({"skills": []}),
+            other => panic!("unexpected {other}"),
+        });
+        assert_eq!(
+            execute("robot.remove_policy", &json!({"name": "never_here"}), &mut robot).unwrap(),
+            json!({"name": "never_here", "removed": false})
+        );
+        assert!(robot.last_change.is_none(), "nothing changed, nothing to wait for");
+        assert_eq!(
+            execute("robot.remove_policy", &json!({"name": "stuck_one"}), &mut robot),
+            Err("install: remove refused".to_string())
+        );
+        drop(robot);
+        server.join().unwrap();
     }
 
     #[test]
