@@ -9,6 +9,7 @@
 pub mod announce;
 pub mod audio;
 pub mod body;
+pub mod camera;
 pub mod config;
 pub mod gait;
 pub mod ha;

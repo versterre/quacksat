@@ -29,6 +29,12 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # Pure-Rust ONNX runtime for the wake-word models (no C deps, ADR 0003 spirit).
 tract-onnx = "0.21"
+# robot.get_frame (camera.rs): Pollen's own UYVY sampler from the same
+# pinned tag as duck-ipc-proto (no dependencies), and two pure-Rust
+# encoders, pinned exactly (no C, cross-compiles with the rest).
+uyvy = { git = "https://github.com/pollen-robotics/microduck.git", tag = "daemon-v0.14.4" }
+jpeg-encoder = { version = "=0.7.1", default-features = false, features = ["std"] }
+base64 = "=0.23.1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time", "signal"] }
 
 quacksat-core = { path = "quacksat-core" }

@@ -232,7 +232,7 @@ Declared by the satellite; all arguments clamped satellite-side.
 | `robot.skill` | `{name}` ∈ whatever `robot.skills` reported (stock: ground_pick, kick_left, kick_right, sit_toggle, roulade) | one-shot skill via `robot.do`; since daemon 0.14 the skill table is config, so the enum announced is the robot's own list and a name outside it is refused before the wire |
 | `robot.move` | `{vx?, vy?, vyaw?, duration_s}` (duration ≤ 3.0 s) | timed walk: intents pumped ≥20 Hz for the duration, then silence — the deadman remains the backstop |
 | `robot.state` | `{}` | condensed `robot.state`/`robot.health`: pose, fallen, battery, mode |
-| `robot.get_frame` | `{}` | **v1: always `ok: false, error: "unsupported"`** (waits for mediad camera access) |
+| `robot.get_frame` | `{}` | one upright JPEG (longest side 640, quality 70) from mediad's `media.frame` socket: `data: {jpeg_b64, width, height}`. With no `[camera] frame_socket` configured: `ok: false, error: "unsupported"`; otherwise failures are `"camera timeout"` (2 s) or `"camera error: <kind>"` |
 
 > The tools from `robot.where_am_i` down to `robot.go_to` are the
 > navigation daemon's (`quack-navd`, ADR 0006). They appear in

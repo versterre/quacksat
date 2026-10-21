@@ -429,6 +429,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
 
 [[package]]
+name = "jpeg-encoder"
+version = "0.7.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a0370574b86f7eca156b9f298392b5e69a23f8c86f3f865add60bbc2e79467a6"
+
+[[package]]
 name = "kstring"
 version = "2.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -885,8 +891,10 @@ name = "quacksat-core"
 version = "0.1.0-rc2"
 dependencies = [
  "anyhow",
+ "base64",
  "duck-ipc-proto",
  "hound",
+ "jpeg-encoder",
  "serde",
  "serde_json",
  "tempfile",
@@ -894,6 +902,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "tract-onnx",
+ "uyvy",
 ]
 
 [[package]]
@@ -1781,6 +1790,11 @@ name = "utf8-zero"
 version = "0.8.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b8c0a043c9540bae7c578c88f91dda8bd82e59ae27c21baca69c8b191aaf5a6e"
+
+[[package]]
+name = "uyvy"
+version = "0.14.4"
+source = "git+https://github.com/pollen-robotics/microduck.git?tag=daemon-v0.14.4#a04e5242722c34a7ce9f8b04805d76830c7d4e33"
 
 [[package]]
 name = "valuable"

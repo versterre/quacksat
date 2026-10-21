@@ -42,6 +42,9 @@ pub struct Config {
     pub nav: NavConfig,
     #[serde(default)]
     pub gait: GaitConfig,
+    /// Where `robot.get_frame` reads the head camera ([`crate::camera`]).
+    #[serde(default)]
+    pub camera: CameraConfig,
     /// What the duck says on its own, outside a turn: how a journey it
     /// was sent on ended, and why it walks when nobody asked
     /// ([`crate::announce`]).
@@ -123,6 +126,17 @@ impl Default for AnnounceConfig {
 }
 
 
+
+/// `[camera]`: mediad's local frame socket (`media.frame`), which
+/// `robot.get_frame` asks for one picture per call. Empty — the default —
+/// leaves the tool answering "unsupported", as before there was a
+/// camera lane. On the robot: `/run/mediad/media.sock` (mode 0660,
+/// group `robot`, which the unit's `SupplementaryGroups` already has).
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct CameraConfig {
+    pub frame_socket: String,
+}
 
 /// Where the navigation daemon listens (`quack-navd`). Enabled by
 /// default: if nothing answers there the satellite says so once and
@@ -478,6 +492,15 @@ mod tests {
         assert_eq!(config.audio.capture_device, "plughw:aic3104,0");
         assert_eq!(config.wake.mode, WakeMode::Energy);
         assert!(!config.direct.mcp.enabled);
+        assert_eq!(config.camera.frame_socket, "", "no camera unless asked");
+    }
+
+    #[test]
+    fn parses_the_camera_socket() {
+        let config: Config =
+            toml::from_str("backend = \"agent\"\n[camera]\nframe_socket = \"/run/mediad/media.sock\"").unwrap();
+        assert_eq!(config.camera.frame_socket, "/run/mediad/media.sock");
+        assert!(toml::from_str::<Config>("backend = \"agent\"\n[camera]\ntypo = 1").is_err());
     }
 
     #[test]

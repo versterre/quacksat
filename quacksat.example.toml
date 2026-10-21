@@ -37,6 +37,13 @@ capture_device = "plughw:aic3104,0"
 enabled = true
 socket = "/run/quack-nav/nav.sock"
 
+[camera]
+# robot.get_frame: one JPEG from the head camera, read from mediad's
+# local frame socket (media.frame). Empty or absent: the tool answers
+# "unsupported". On the robot mediad serves it here (group `robot`):
+# frame_socket = "/run/mediad/media.sock"
+frame_socket = ""
+
 # What the duck says on its own, between turns: how a journey it was
 # sent on ended ("Sono arrivata in cucina", "Mi sono fermata", ...) and
 # why it walks when nobody asked (the homecoming's search, the

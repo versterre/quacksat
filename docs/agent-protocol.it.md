@@ -245,7 +245,7 @@ lato satellite.
 | `robot.skill` | `{name}` ∈ ciò che ha riportato `robot.skills` (stock: ground_pick, kick_left, kick_right, sit_toggle, roulade) | skill one-shot via `robot.do`; dal demone 0.14 la tabella delle skill è config, quindi l'enum annunciato è la lista del robot e un nome fuori da quella è rifiutato prima del filo |
 | `robot.move` | `{vx?, vy?, vyaw?, duration_s}` (duration ≤ 3.0 s) | camminata a tempo: intenti pompati a ≥20 Hz per la durata, poi silenzio — il deadman resta la rete di sicurezza |
 | `robot.state` | `{}` | sintesi di `robot.state`/`robot.health`: posa, caduto, batteria, modalità |
-| `robot.get_frame` | `{}` | **v1: sempre `ok: false, error: "unsupported"`** (in attesa dell'accesso camera via mediad) |
+| `robot.get_frame` | `{}` | un JPEG dritto (lato lungo 640, qualità 70) dal socket `media.frame` di mediad: `data: {jpeg_b64, width, height}`. Senza `[camera] frame_socket` configurato: `ok: false, error: "unsupported"`; altrimenti gli errori sono `"camera timeout"` (2 s) o `"camera error: <tipo>"` |
 
 > I tool da `robot.where_am_i` a `robot.go_to` sono del demone di
 > navigazione (`quack-navd`, ADR 0006). Compaiono nel catalogo di

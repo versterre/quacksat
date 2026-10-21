@@ -92,6 +92,9 @@ pub struct Robot {
     /// here starts, so it can say how the job ended. Set by the
     /// backends that can speak outside a turn (`direct`, `agent`).
     pub announcer: Option<crate::announce::Announcer>,
+    /// mediad's frame socket for `robot.get_frame` (`[camera]
+    /// frame_socket`); empty when this robot has no camera lane.
+    pub camera: String,
 }
 
 impl Robot {
@@ -107,6 +110,7 @@ impl Robot {
             skills,
             nav: NavLane::probe(&config.nav),
             announcer: None,
+            camera: config.camera.frame_socket.clone(),
         }
     }
 
@@ -132,6 +136,7 @@ impl Robot {
             skills: stock_skills(),
             nav: None,
             announcer: None,
+            camera: String::new(),
         }
     }
 }
@@ -224,10 +229,17 @@ pub fn catalog(robot: &Robot) -> Value {
             "parameters": {"type": "object", "properties": {}}
         }),
     ];
+    let get_frame = if robot.camera.trim().is_empty() {
+        "Grab a camera frame. Not supported yet on this robot — if it \
+    fails, tell the user you cannot see yet."
+    } else {
+        "Grab what the duck's head camera sees right now: an upright JPEG \
+    (jpeg_b64, base64) with its width and height. Use it when asked what the duck \
+    sees, or to look before walking. If it fails, say you cannot see right now."
+    };
     tools.push(json!({
         "name": "robot.get_frame",
-        "description": "Grab a camera frame. Not supported yet on this robot — if it \
-    fails, tell the user you cannot see yet.",
+        "description": get_frame,
         "parameters": {"type": "object", "properties": {}}
     }));
     if let Some(nav) = robot.nav.as_ref() {
@@ -254,6 +266,11 @@ pub fn execute(name: &str, args: &Value, robot: &mut Robot) -> Result<Value, Str
             announcer.tool_called(name, args, answer);
         }
         return answer;
+    }
+    // The camera is mediad's, not robotd's: a frame does not wait on
+    // (or redial) the robot's lane.
+    if name == "robot.get_frame" {
+        return crate::camera::grab(&robot.camera).map_err(|error| error.to_string());
     }
     // Everything below needs the robot, so this is where a lane that
     // died gets one attempt to come back.
@@ -350,7 +367,6 @@ pub fn execute(name: &str, args: &Value, robot: &mut Robot) -> Result<Value, Str
                 "mode": mode,
             }))
         }
-        "robot.get_frame" => Err("unsupported".to_string()),
         other => Err(format!("unknown tool `{other}`")),
     }
 }
@@ -392,6 +408,23 @@ mod tests {
             execute("robot.get_frame", &json!({}), &mut robot),
             Err("unsupported".to_string())
         );
+    }
+
+    #[test]
+    fn get_frame_goes_to_the_camera_socket_when_one_is_configured() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut robot = Robot::detached();
+        robot.camera = dir.path().join("media.sock").to_str().unwrap().to_string();
+        let error = execute("robot.get_frame", &json!({}), &mut robot).unwrap_err();
+        assert!(error.starts_with("camera error: "), "{error}");
+        let catalog = catalog(&robot);
+        let tool = catalog
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|tool| tool["name"] == "robot.get_frame")
+            .unwrap();
+        assert!(tool["description"].as_str().unwrap().contains("JPEG"));
     }
 
     #[test]
