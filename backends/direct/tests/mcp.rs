@@ -95,7 +95,9 @@ fn mcp_server_speaks_the_stateless_protocol() {
     // its socket; this test runs without one (the split of 2026-09-22).
     assert!(!names.contains(&"robot_where_am_i"));
     assert!(!names.contains(&"robot_map_step"));
-    assert_eq!(names.len(), 7);
+    // The satellite's own seven plus the three install tools.
+    assert!(names.contains(&"robot_install_policy"));
+    assert_eq!(names.len(), 10);
 
     // tools/call: unsupported and no-robot outcomes travel as isError.
     let (_, reply) = post(

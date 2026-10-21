@@ -246,11 +246,14 @@ lato satellite.
 | `robot.move` | `{vx?, vy?, vyaw?, duration_s}` (duration ≤ 3.0 s) | camminata a tempo: intenti pompati a ≥20 Hz per la durata, poi silenzio — il deadman resta la rete di sicurezza |
 | `robot.state` | `{}` | sintesi di `robot.state`/`robot.health`: posa, caduto, batteria, modalità |
 | `robot.get_frame` | `{}` | un JPEG dritto (lato lungo 640, qualità 70) dal socket `media.frame` di mediad: `data: {jpeg_b64, width, height}`. Senza `[camera] frame_socket` configurato: `ok: false, error: "unsupported"`; altrimenti gli errori sono `"camera timeout"` (2 s) o `"camera error: <tipo>"` |
+| `robot.install_policy` | `{source, file?, name, slot?, duration_s?, chain?}` | scarica una policy e la registra in robotd come skill **utente**. `source` è un repo dell'Hub `org/repo` (da `https://huggingface.co/<org>/<repo>/resolve/main/<file>`) o un URL `https://` su `huggingface.co` o `storage.googleapis.com`; `file` di default `policy.onnx`; `name` è `[a-z][a-z0-9_]{1,31}` e mai una skill del robot (`walk`, `stand`, `sitstand`, `sit_toggle`, `ground_pick`, `kick_left`, `kick_right`, `roulade`); `slot` solo `"user"`; `duration_s` di default **3** (quello che manda il Policy Playground), al massimo 60; `chain` `true`/`false`. Il file va in `[install] dir/<name>/<file>` (scritto come `.part` e poi rinominato): **tetto 20 MB, timeout 60 s**, primo byte `0x08`. Poi robotd `robot.setSkill {name, path, duration, chain?}`. Aspetta fino a 10 s un robot che sta tornando a casa. `data: {name, bytes, stage: "installing"}`; errori: `install: download failed`, `install: not an onnx file`, `install: too large`, `install: slot refused`, `install: setSkill refused`, `install: robot unavailable`. Misurato sul sim del Mac (2026-10-21): 793 774 byte in 0,84–1,16 s |
+| `robot.policy_status` | `{name}` | lo stato di una skill installata, da `robot.policies` di robotd: `data: {name, state, detail?}`, `state` ∈ `homing`, `homed`, `missing`, `error`. Sul sim `homed` arriva 2,0 s dopo l'installazione |
+| `robot.remove_policy` | `{name}` | toglie una skill utente: `robot.removeSkill {name}` di robotd, poi cancella `[install] dir/<name>`. `data: {name, removed}`; errori `install: slot refused`, `install: remove refused`, `install: robot unavailable` |
 
 > I tool da `robot.where_am_i` a `robot.go_to` sono del demone di
 > navigazione (`quack-navd`, ADR 0006). Compaiono nel catalogo di
 > `session.start` solo quando un demone risponde su `[nav] socket`;
-> senza, il satellite annuncia i suoi sette e la papera non può essere
+> senza, il satellite annuncia i suoi dieci e la papera non può essere
 > mandata da nessuna parte.
 
 | `robot.where_am_i` | `{}` | il luogo memorizzato più vicino e la distanza (`at_place` se dentro il suo raggio), dalla mappa dal vivo di robotd (`robot.map`, ADR 0005); `known: false` con un motivo finché la posa non è fidata (seduto, in ricerca, senza mappa); errore se il robot non mappa affatto |

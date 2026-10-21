@@ -95,6 +95,10 @@ pub struct Robot {
     /// mediad's frame socket for `robot.get_frame` (`[camera]
     /// frame_socket`); empty when this robot has no camera lane.
     pub camera: String,
+    /// Where `robot.install_policy` writes policies (`[install] dir`).
+    pub install_dir: std::path::PathBuf,
+    /// The install `robot.policy_status` is following, if any.
+    pub pending_install: Option<crate::install::Pending>,
 }
 
 impl Robot {
@@ -111,6 +115,8 @@ impl Robot {
             nav: NavLane::probe(&config.nav),
             announcer: None,
             camera: config.camera.frame_socket.clone(),
+            install_dir: config.install.dir.clone().into(),
+            pending_install: None,
         }
     }
 
@@ -137,6 +143,8 @@ impl Robot {
             nav: None,
             announcer: None,
             camera: String::new(),
+            install_dir: crate::install::DEFAULT_DIR.into(),
+            pending_install: None,
         }
     }
 }
@@ -242,6 +250,44 @@ pub fn catalog(robot: &Robot) -> Value {
         "description": get_frame,
         "parameters": {"type": "object", "properties": {}}
     }));
+    tools.push(json!({
+        "name": "robot.install_policy",
+        "description": "Install a policy from the Hugging Face Hub (source org/repo) or an \
+    https URL as a new user skill named `name`; the duck then homes (moves its joints) for \
+    a few seconds. Follow it with robot.policy_status until homed. Never replaces the \
+    robot's own skills.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "source": {"type": "string", "description": "Hub repo `org/repo`, or an https URL"},
+                "file": {"type": "string", "description": "the .onnx in the repo, default policy.onnx"},
+                "name": {"type": "string", "description": "the skill's name: lowercase letters, digits, _"},
+                "slot": {"type": "string", "enum": ["user"]},
+                "duration_s": {"type": "number", "description": "seconds it runs, default 3", "minimum": 0.1, "maximum": crate::install::MAX_DURATION_S},
+                "chain": {"type": "string", "enum": ["true", "false"], "description": "whether a request while it runs queues another"}
+            },
+            "required": ["source", "name"]
+        }
+    }));
+    tools.push(json!({
+        "name": "robot.policy_status",
+        "description": "Where an installed skill stands: homing (the duck is moving to its \
+    home pose), homed (ready for robot.skill), missing or error.",
+        "parameters": {
+            "type": "object",
+            "properties": {"name": {"type": "string"}},
+            "required": ["name"]
+        }
+    }));
+    tools.push(json!({
+        "name": "robot.remove_policy",
+        "description": "Take an installed user skill off the duck again.",
+        "parameters": {
+            "type": "object",
+            "properties": {"name": {"type": "string"}},
+            "required": ["name"]
+        }
+    }));
     if let Some(nav) = robot.nav.as_ref() {
         // The navigation daemon's own tools, announced as if they were
         // ours: the agent sees one robot, `execute` routes by name.
@@ -271,6 +317,12 @@ pub fn execute(name: &str, args: &Value, robot: &mut Robot) -> Result<Value, Str
     // (or redial) the robot's lane.
     if name == "robot.get_frame" {
         return crate::camera::grab(&robot.camera).map_err(|error| error.to_string());
+    }
+    match name {
+        "robot.install_policy" => return install_policy(args, robot),
+        "robot.policy_status" => return policy_status(args, robot),
+        "robot.remove_policy" => return remove_policy(args, robot),
+        _ => {}
     }
     // Everything below needs the robot, so this is where a lane that
     // died gets one attempt to come back.
@@ -369,6 +421,133 @@ pub fn execute(name: &str, args: &Value, robot: &mut Robot) -> Result<Value, Str
         }
         other => Err(format!("unknown tool `{other}`")),
     }
+}
+
+/// `robot.install_policy`: check, download, `robot.setSkill`. Every
+/// refusal is one of [`crate::install`]'s fixed lines.
+fn install_policy(args: &Value, robot: &mut Robot) -> Result<Value, String> {
+    let request = crate::install::Request::parse(args).map_err(str::to_string)?;
+    install_with(request, robot)
+}
+
+/// [`install_policy`] once the request is checked: split out so a test
+/// can point `url` at a loopback server.
+fn install_with(request: crate::install::Request, robot: &mut Robot) -> Result<Value, String> {
+    use crate::install::{self, ROBOT_UNAVAILABLE, SET_SKILL_REFUSED};
+    // The robot first: no point fetching 20 MB for a duck that is not there.
+    robot.redial();
+    policies(&mut robot.lane.control)?;
+    let (path, bytes) =
+        install::fetch_to(&robot.install_dir, &request.name, &request.file, &request.url)
+            .map_err(str::to_string)?;
+    let before = settled(&mut robot.lane.control)?;
+    let params = proto::SkillParams {
+        name: request.name.clone(),
+        path: Some(path.to_string_lossy().into_owned()),
+        duration: Some(request.duration_s),
+        chain: request.chain,
+        ..Default::default()
+    };
+    let response = request_or(&mut robot.lane.control, &proto::Call::RobotSetSkill(params), ROBOT_UNAVAILABLE)?;
+    let accepted = response.error.is_none()
+        && response
+            .result_as::<proto::IntentResult>()
+            .is_ok_and(|result| result.accepted);
+    if !accepted {
+        tracing::info!(name = %request.name, "robotd refused the skill");
+        return Err(SET_SKILL_REFUSED.to_string());
+    }
+    tracing::info!(name = %request.name, bytes, "skill installed, robot homing");
+    robot.pending_install = Some(install::Pending::before(&request.name, &before));
+    Ok(install::installed(&request.name, bytes))
+}
+
+/// `robot.policy_status`: `robot.policies`, read for one name.
+fn policy_status(args: &Value, robot: &mut Robot) -> Result<Value, String> {
+    let name = args
+        .get("name")
+        .and_then(Value::as_str)
+        .ok_or(crate::install::SLOT_REFUSED)?;
+    crate::install::validate_name(name)?;
+    robot.redial();
+    let answer = policies(&mut robot.lane.control)?;
+    let (state, detail) = crate::install::status(&answer, name, robot.pending_install.as_mut());
+    if state == "homed" && robot.pending_install.as_ref().is_some_and(|p| p.name == name) {
+        robot.pending_install = None;
+        // So `robot.skill` takes the new name from now on.
+        robot.skills = skills_of(&mut robot.lane.control);
+    }
+    let mut data = json!({"name": name, "state": state});
+    if let Some(detail) = detail {
+        data["detail"] = json!(detail);
+    }
+    Ok(data)
+}
+
+/// `robot.remove_policy`: robotd's `robot.removeSkill`, then the files.
+fn remove_policy(args: &Value, robot: &mut Robot) -> Result<Value, String> {
+    use crate::install::{REMOVE_REFUSED, ROBOT_UNAVAILABLE, SLOT_REFUSED};
+    let name = args.get("name").and_then(Value::as_str).ok_or(SLOT_REFUSED)?;
+    crate::install::validate_name(name)?;
+    robot.redial();
+    settled(&mut robot.lane.control)?;
+    let call = proto::Call::RobotRemoveSkill(proto::SkillNameParams { name: name.to_string() });
+    let response = request_or(&mut robot.lane.control, &call, ROBOT_UNAVAILABLE)?;
+    let result = response
+        .error
+        .is_none()
+        .then(|| response.result_as::<proto::IntentResult>().ok())
+        .flatten()
+        .filter(|result| result.accepted)
+        .ok_or(REMOVE_REFUSED)?;
+    // `already` (nothing configured by that name) carries a reason.
+    let removed = result.reason.is_none();
+    crate::install::remove_files(&robot.install_dir, name);
+    if robot.pending_install.as_ref().is_some_and(|p| p.name == name) {
+        robot.pending_install = None;
+    }
+    robot.skills = skills_of(&mut robot.lane.control);
+    tracing::info!(name, removed, "skill removed");
+    Ok(json!({"name": name, "removed": removed}))
+}
+
+/// `robot.policies`' answer, or `install: robot unavailable`.
+fn policies(control: &mut Option<Control>) -> Result<Value, String> {
+    let unavailable = crate::install::ROBOT_UNAVAILABLE;
+    let response = request_or(control, &proto::Call::RobotPolicies, unavailable)?;
+    if response.error.is_some() {
+        return Err(unavailable.to_string());
+    }
+    response.result.ok_or_else(|| unavailable.to_string())
+}
+
+/// `robot.policies` once the robot is not homing, or after
+/// [`crate::install::SETTLE_TIMEOUT`] regardless: robotd drops a skill
+/// change that arrives while another change's reload is in flight (an
+/// install right after a remove, measured on the sim 2026-10-21), and
+/// `homed: false` is how that reload shows.
+fn settled(control: &mut Option<Control>) -> Result<Value, String> {
+    let deadline = std::time::Instant::now() + crate::install::SETTLE_TIMEOUT;
+    loop {
+        let answer = policies(control)?;
+        let homing = answer.get("homed").and_then(Value::as_bool) == Some(false);
+        if !homing || std::time::Instant::now() >= deadline {
+            if homing {
+                tracing::info!("the robot is still homing; changing the skill table anyway");
+            }
+            return Ok(answer);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+}
+
+/// [`request`], with every transport failure reported as `error`.
+fn request_or(
+    control: &mut Option<Control>,
+    call: &proto::Call,
+    error: &str,
+) -> Result<proto::Response, String> {
+    request(control, call).map_err(|_| error.to_string())
 }
 
 /// Start or stop the "map everything" job.
@@ -636,6 +815,181 @@ mod tests {
         server.join().unwrap();
     }
 
+    /// A fake robotd on one connection: every request goes to `answer`,
+    /// which returns the `result` to send, and is recorded.
+    fn fake_robotd(
+        answer: impl Fn(&proto::Request) -> Value + Send + 'static,
+    ) -> (tempfile::TempDir, Robot, std::thread::JoinHandle<Vec<proto::Request>>) {
+        use std::io::{BufRead, BufReader, Write};
+        use std::os::unix::net::UnixListener;
+
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("robotd.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut writer = stream;
+            let mut seen = Vec::new();
+            loop {
+                let mut line = String::new();
+                if reader.read_line(&mut line).unwrap_or(0) == 0 {
+                    return seen;
+                }
+                let request: proto::Request = serde_json::from_str(&line).unwrap();
+                let result = answer(&request);
+                let mut out = serde_json::to_vec(
+                    &json!({"jsonrpc": "2.0", "id": request.id, "result": result}),
+                )
+                .unwrap();
+                out.push(b'\n');
+                writer.write_all(&out).unwrap();
+                writer.flush().unwrap();
+                seen.push(request);
+            }
+        });
+        let mut robot = Robot::detached();
+        robot.lane.control = Some(Control::connect(socket.to_str().unwrap()).unwrap());
+        robot.install_dir = dir.path().join("policies");
+        (dir, robot, server)
+    }
+
+    fn request_for(name: &str, url: String) -> crate::install::Request {
+        let mut request =
+            crate::install::Request::parse(&json!({"source": "org/repo", "name": name})).unwrap();
+        request.url = url;
+        request
+    }
+
+    #[test]
+    fn install_refusals_need_neither_the_network_nor_the_robot() {
+        let mut robot = Robot::detached();
+        for (args, error) in [
+            (json!({"source": "org/repo", "name": "walk"}), "install: slot refused"),
+            (json!({"source": "org/repo", "name": "roulade"}), "install: slot refused"),
+            (json!({"source": "org/repo", "name": "bow", "file": "../x.onnx"}), "install: slot refused"),
+            (json!({"source": "org/repo", "name": "bow", "slot": "walk"}), "install: slot refused"),
+            (json!({"source": "file:///etc/passwd", "name": "bow"}), "install: download failed"),
+            (json!({"source": "https://evil.example/x.onnx", "name": "bow"}), "install: download failed"),
+            (json!({"source": "org/repo", "name": "bow"}), "install: robot unavailable"),
+        ] {
+            assert_eq!(execute("robot.install_policy", &args, &mut robot), Err(error.to_string()), "{args}");
+        }
+        assert_eq!(
+            execute("robot.policy_status", &json!({"name": "bow"}), &mut robot),
+            Err("install: robot unavailable".to_string())
+        );
+        assert_eq!(
+            execute("robot.policy_status", &json!({"name": "../bow"}), &mut robot),
+            Err("install: slot refused".to_string())
+        );
+        assert_eq!(
+            execute("robot.remove_policy", &json!({"name": "kick_left"}), &mut robot),
+            Err("install: slot refused".to_string())
+        );
+    }
+
+    #[test]
+    fn an_install_lands_the_file_registers_it_and_is_followed_to_homed() {
+        use crate::install::tests::{ok_head, serve};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        // robotd as the sim behaves: homed until the reload starts, then
+        // homing without the new name, then listed and homed.
+        let polls = Arc::new(AtomicUsize::new(0));
+        let counter = polls.clone();
+        let (dir, mut robot, server) = fake_robotd(move |request| match request.method.as_str() {
+            "robot.policies" => match counter.fetch_add(1, Ordering::SeqCst) {
+                0 | 1 => json!({"mode": "walk", "enabled": true, "slots": [], "skills": ["roulade"], "homed": true}),
+                2 => json!({"mode": "walk", "enabled": true, "slots": [], "skills": ["roulade"], "homed": false}),
+                _ => json!({"mode": "walk", "enabled": true, "slots": [], "skills": ["roulade", "flamingo_cycle"], "homed": true}),
+            },
+            "robot.setSkill" => json!({"accepted": true}),
+            "robot.skills" => json!({"skills": [{"name": "flamingo_cycle"}], "built_in": ["sit_toggle"]}),
+            other => panic!("unexpected {other}"),
+        });
+        let body = vec![0x08, 0x08, 0x12, 0x07];
+        let (url, http) = serve(ok_head(body.len()), body.clone());
+        let answer = install_with(request_for("flamingo_cycle", url), &mut robot).unwrap();
+        http.join().unwrap();
+        assert_eq!(answer, json!({"name": "flamingo_cycle", "bytes": 4, "stage": "installing"}));
+        let landed = dir.path().join("policies/flamingo_cycle/policy.onnx");
+        assert_eq!(std::fs::read(&landed).unwrap(), body);
+
+        let status = |robot: &mut Robot| {
+            execute("robot.policy_status", &json!({"name": "flamingo_cycle"}), robot).unwrap()["state"].clone()
+        };
+        assert_eq!(status(&mut robot), "homing");
+        assert_eq!(status(&mut robot), "homed");
+        assert!(robot.pending_install.is_none());
+        assert_eq!(robot.skills, vec!["flamingo_cycle".to_string(), "sit_toggle".to_string()]);
+        assert_eq!(
+            execute("robot.policy_status", &json!({"name": "other_one"}), &mut robot).unwrap(),
+            json!({"name": "other_one", "state": "missing"})
+        );
+        drop(robot);
+        let seen = server.join().unwrap();
+        let set = seen.iter().find(|r| r.method == "robot.setSkill").unwrap();
+        // Exactly what robotd's `SkillParams` (deny_unknown_fields) takes:
+        // no slot, no chain unless asked, the Playground's 3 s.
+        assert_eq!(
+            set.params.clone().unwrap(),
+            json!({"name": "flamingo_cycle", "path": landed.to_str().unwrap(), "duration": 3.0})
+        );
+    }
+
+    #[test]
+    fn a_refusal_from_robotd_is_one_line_and_a_bad_file_never_reaches_it() {
+        use crate::install::tests::{ok_head, serve};
+
+        let (_dir, mut robot, server) = fake_robotd(|request| match request.method.as_str() {
+            "robot.policies" => json!({"skills": [], "homed": true}),
+            "robot.setSkill" => json!({"accepted": false, "reason": "no such file: /secret/path.onnx"}),
+            other => panic!("unexpected {other}"),
+        });
+        let (url, http) = serve(ok_head(4), vec![0x08, 1, 2, 3]);
+        assert_eq!(
+            install_with(request_for("bow", url), &mut robot),
+            Err("install: setSkill refused".to_string())
+        );
+        http.join().unwrap();
+        assert!(robot.pending_install.is_none());
+
+        let (url, http) = serve(ok_head(15), b"<!doctype html>".to_vec());
+        assert_eq!(install_with(request_for("bow", url), &mut robot), Err("install: not an onnx file".to_string()));
+        http.join().unwrap();
+        let (url, http) = serve("HTTP/1.1 200 OK\r\nContent-Length: 30000000", Vec::new());
+        assert_eq!(install_with(request_for("bow", url), &mut robot), Err("install: too large".to_string()));
+        http.join().unwrap();
+        drop(robot);
+        let seen = server.join().unwrap();
+        assert_eq!(seen.iter().filter(|r| r.method == "robot.setSkill").count(), 1);
+    }
+
+    #[test]
+    fn remove_policy_asks_robotd_and_drops_the_files() {
+        let (dir, mut robot, server) = fake_robotd(|request| match request.method.as_str() {
+            "robot.policies" => json!({"skills": ["flamingo_cycle"], "homed": true}),
+            "robot.removeSkill" => json!({"accepted": true}),
+            "robot.skills" => json!({"skills": [{"name": "roulade"}]}),
+            other => panic!("unexpected {other}"),
+        });
+        let folder = dir.path().join("policies/flamingo_cycle");
+        std::fs::create_dir_all(&folder).unwrap();
+        std::fs::write(folder.join("policy.onnx"), [8u8]).unwrap();
+        assert_eq!(
+            execute("robot.remove_policy", &json!({"name": "flamingo_cycle"}), &mut robot).unwrap(),
+            json!({"name": "flamingo_cycle", "removed": true})
+        );
+        assert!(!folder.exists());
+        assert_eq!(robot.skills, vec!["roulade".to_string()]);
+        drop(robot);
+        let seen = server.join().unwrap();
+        let remove = seen.iter().find(|r| r.method == "robot.removeSkill").unwrap();
+        assert_eq!(remove.params.clone().unwrap(), json!({"name": "flamingo_cycle"}));
+    }
+
     #[test]
     fn catalog_matches_the_executor_allowlist() {
         // Without a navigation daemon the satellite announces its own
@@ -658,6 +1012,9 @@ mod tests {
                 "robot.move",
                 "robot.state",
                 "robot.get_frame",
+                "robot.install_policy",
+                "robot.policy_status",
+                "robot.remove_policy",
             ]
         );
         let mut robot = Robot::detached();

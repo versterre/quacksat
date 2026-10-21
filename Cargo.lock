@@ -902,6 +902,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "tract-onnx",
+ "ureq",
  "uyvy",
 ]
 

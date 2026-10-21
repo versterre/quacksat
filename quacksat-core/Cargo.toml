@@ -19,6 +19,9 @@ toml.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 tract-onnx.workspace = true
+# robot.install_policy (install.rs): the same sync rustls client the
+# direct backend already uses, so nothing new in the lock file.
+ureq = "3"
 uyvy.workspace = true
 
 [dev-dependencies]

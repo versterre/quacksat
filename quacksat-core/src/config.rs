@@ -45,6 +45,10 @@ pub struct Config {
     /// Where `robot.get_frame` reads the head camera ([`crate::camera`]).
     #[serde(default)]
     pub camera: CameraConfig,
+    /// Where `robot.install_policy` puts the policies it downloads
+    /// ([`crate::install`]).
+    #[serde(default)]
+    pub install: InstallConfig,
     /// What the duck says on its own, outside a turn: how a journey it
     /// was sent on ended, and why it walks when nobody asked
     /// ([`crate::announce`]).
@@ -136,6 +140,25 @@ impl Default for AnnounceConfig {
 #[serde(default, deny_unknown_fields)]
 pub struct CameraConfig {
     pub frame_socket: String,
+}
+
+/// `[install]`: where `robot.install_policy` writes the policies it
+/// downloads, one folder per skill name (`<dir>/<name>/<file>`).
+///
+/// Unlike `[camera]` this one has a default, `/var/lib/quacksat/policies`:
+/// the install tools are useless without a directory, and that one is the
+/// duck's own writable data directory (the unit's `StateDirectory`,
+/// readable by robotd). Point it elsewhere only off the robot.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct InstallConfig {
+    pub dir: String,
+}
+
+impl Default for InstallConfig {
+    fn default() -> Self {
+        Self { dir: crate::install::DEFAULT_DIR.into() }
+    }
 }
 
 /// Where the navigation daemon listens (`quack-navd`). Enabled by
@@ -493,6 +516,15 @@ mod tests {
         assert_eq!(config.wake.mode, WakeMode::Energy);
         assert!(!config.direct.mcp.enabled);
         assert_eq!(config.camera.frame_socket, "", "no camera unless asked");
+    }
+
+    #[test]
+    fn the_install_dir_has_a_default_and_can_be_moved() {
+        let config: Config = toml::from_str("backend = \"agent\"").unwrap();
+        assert_eq!(config.install.dir, "/var/lib/quacksat/policies");
+        let config: Config = toml::from_str("backend = \"agent\"\n[install]\ndir = \"/tmp/p\"").unwrap();
+        assert_eq!(config.install.dir, "/tmp/p");
+        assert!(toml::from_str::<Config>("backend = \"agent\"\n[install]\ntypo = 1").is_err());
     }
 
     #[test]

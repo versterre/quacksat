@@ -44,6 +44,17 @@ socket = "/run/quack-nav/nav.sock"
 # frame_socket = "/run/mediad/media.sock"
 frame_socket = ""
 
+[install]
+# robot.install_policy / robot.policy_status / robot.remove_policy: where
+# downloaded policies go, one folder per skill (<dir>/<name>/policy.onnx).
+# Unlike [camera] this has a default: the tools need a directory, and
+# /var/lib/quacksat is the unit's own StateDirectory (readable by robotd).
+# Downloads: Hub repo or https URL on huggingface.co /
+# storage.googleapis.com, 20 MB cap, 60 s timeout. On the Mac sim the
+# Hub's flamingo-cycle (794 KB) downloads in about 1 s and the duck is
+# homed with the new skill about 2 s later.
+dir = "/var/lib/quacksat/policies"
+
 # What the duck says on its own, between turns: how a journey it was
 # sent on ended ("Sono arrivata in cucina", "Mi sono fermata", ...) and
 # why it walks when nobody asked (the homecoming's search, the
