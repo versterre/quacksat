@@ -6,7 +6,7 @@
 use std::collections::VecDeque;
 use std::net::TcpStream;
 use std::sync::mpsc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -66,6 +66,9 @@ struct Socket {
     /// and takes it again at once, and std's mutex is not fair: without
     /// this the camera thread would starve (about one frame a second).
     waiting: AtomicUsize,
+    /// Set when the session is over: a camera thread still running sends
+    /// nothing more, and its sink lets go of the socket.
+    closed: AtomicBool,
 }
 
 fn lock(ws: &Shared) -> std::sync::MutexGuard<'_, Ws> {
@@ -83,10 +86,13 @@ fn give_way(ws: &Shared) {
 fn frame_sink(ws: &Shared) -> quacksat_core::stream::Sink {
     let ws = Arc::clone(ws);
     Arc::new(move |jpeg: &[u8]| {
+        if ws.closed.load(Ordering::SeqCst) {
+            return false;
+        }
         ws.waiting.fetch_add(1, Ordering::SeqCst);
         let mut guard = lock(&ws);
         ws.waiting.fetch_sub(1, Ordering::SeqCst);
-        guard.send(Message::binary(jpeg.to_vec())).is_ok()
+        !ws.closed.load(Ordering::SeqCst) && guard.send(Message::binary(jpeg.to_vec())).is_ok()
     })
 }
 
@@ -100,9 +106,14 @@ pub fn run_session(ws: Ws, deps: &mut Deps) -> anyhow::Result<()> {
         tls.get_ref().set_read_timeout(Some(POLL))?;
         tls.get_ref().set_write_timeout(Some(Duration::from_secs(5)))?;
     }
-    let ws: Shared = Arc::new(Socket { ws: Mutex::new(ws), waiting: AtomicUsize::new(0) });
+    let ws: Shared = Arc::new(Socket {
+        ws: Mutex::new(ws),
+        waiting: AtomicUsize::new(0),
+        closed: AtomicBool::new(false),
+    });
     deps.robot.frame_sink = Some(frame_sink(&ws));
     let result = session_loop(&ws, deps);
+    ws.closed.store(true, Ordering::SeqCst);
     deps.robot.stream.stop();
     deps.robot.frame_sink = None;
     result
@@ -260,14 +271,18 @@ fn session_loop(ws: &Shared, deps: &mut Deps) -> anyhow::Result<()> {
                     }
                     other => tracing::debug!(event = other, "ignored event"),
                 }
+                // Stamped again once handled: a tts.end that drained the
+                // speaker or a long tool call is not the agent being quiet.
+                last_heard = Instant::now();
                 continue;
             }
             // TTS audio; anything binary outside a clip is dropped.
             Ok(Message::Binary(bytes)) => {
-                last_heard = Instant::now();
                 if playing_tts {
+                    // Blocks once the player's pipe is full.
                     deps.player.write_stream(&bytes);
                 }
+                last_heard = Instant::now();
                 continue;
             }
             Ok(Message::Close(_)) => return Ok(()),
@@ -280,8 +295,8 @@ fn session_loop(ws: &Shared, deps: &mut Deps) -> anyhow::Result<()> {
                 if e.kind() == std::io::ErrorKind::WouldBlock
                     || e.kind() == std::io::ErrorKind::TimedOut =>
             {
-                // Checked only while polling: after a long tts.end or walk the
-                // queued messages are read first, so blocked time never counts.
+                // Checked only while polling, against the end of the last
+                // handled message: time blocked in a handler never counts.
                 if last_heard.elapsed() > quacksat_core::stream::IDLE && deps.robot.stream.is_on() {
                     tracing::info!("camera stream: nothing from the agent for 10 s — stopped");
                     deps.robot.stream.stop();

@@ -244,7 +244,7 @@ Declared by the satellite; all arguments clamped satellite-side.
 > The tools from `robot.where_am_i` down to `robot.go_to` are the
 > navigation daemon's (`quack-navd`, ADR 0006). They appear in
 > `session.start`'s catalog only when a daemon answers on
-> `[nav] socket`; without one the satellite announces its own ten and
+> `[nav] socket`; without one the satellite announces its own eleven and
 > the duck cannot be sent anywhere.
 
 | `robot.where_am_i` | `{}` | the nearest remembered place and the distance to it (`at_place` inside its radius), from robotd's live map (`robot.map`, ADR 0005); `known: false` with a reason while the pose is untrusted (seated, searching, no map); an error when the robot does not map at all |

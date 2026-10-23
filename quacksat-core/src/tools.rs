@@ -458,8 +458,6 @@ pub fn execute(name: &str, args: &Value, robot: &mut Robot) -> Result<Value, Str
     }
 }
 
-/// `robot.install_policy`: check, download, `robot.setSkill`. Every
-/// refusal is one of [`crate::install`]'s fixed lines.
 /// `robot.stream {on, fps?, width?}` (Duck remote). Refusals are one line, no paths.
 fn stream_tool(args: &Value, robot: &mut Robot) -> Result<Value, String> {
     use crate::stream::{DEFAULT_FPS, DEFAULT_WIDTH, MAX_FPS, MAX_WIDTH, MIN_FPS, MIN_WIDTH};
@@ -497,6 +495,8 @@ fn stream_tool(args: &Value, robot: &mut Robot) -> Result<Value, String> {
     Ok(json!({"on": true, "fps": fps, "width": width}))
 }
 
+/// `robot.install_policy`: check, download, `robot.setSkill`. Every
+/// refusal is one of [`crate::install`]'s fixed lines.
 fn install_policy(args: &Value, robot: &mut Robot) -> Result<Value, String> {
     let request = crate::install::Request::parse(args).map_err(str::to_string)?;
     install_with(request, robot, crate::install::fetch_to)

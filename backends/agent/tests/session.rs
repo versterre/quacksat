@@ -492,6 +492,8 @@ fn streaming_sends_jpegs_and_a_wake_turn_still_works() {
                                         player: &mut player, robot: &mut robot })
         });
         let (stream, _) = listener.accept().unwrap();
+        // A read that never comes fails the test instead of hanging it.
+        stream.set_read_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
         let mut bridge = tungstenite::accept(stream).unwrap();
         let next_text = |bridge: &mut tungstenite::WebSocket<std::net::TcpStream>| -> Value {
             loop {
@@ -589,8 +591,74 @@ fn the_stream_stops_after_ten_quiet_seconds() {
                 Err(e) => panic!("{e}"),
             }
         }
-        assert!(early > 20, "{early}");
+        // About 72 at 8 fps: a half-starved stream (the loop hogging the lock) fails here.
+        assert!(early > 50, "{early}");
         assert_eq!(late, 0, "frames still came 10 s after the agent went quiet");
+        bridge.close(None).unwrap();
+        let _ = bridge.read();
+        satellite.join().unwrap().unwrap();
+    });
+}
+
+/// A fake aplay that drains its input and then plays for `seconds` more:
+/// `tts.end` blocks the session loop that long (the speaker draining).
+fn slow_aplay(dir: &std::path::Path, seconds: u64) -> String {
+    let script = dir.join("slow-aplay");
+    // No arguments (the warm-up run below): exit at once.
+    std::fs::write(&script, format!("#!/bin/sh\ncat >/dev/null\n[ $# -gt 0 ] && sleep {seconds}\nexit 0\n")).unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    let mut perms = std::fs::metadata(&script).unwrap().permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&script, perms).unwrap();
+    // macOS inspects a freshly written executable on its first exec.
+    let _ = std::process::Command::new(&script).stdin(std::process::Stdio::null()).status();
+    script.to_str().unwrap().to_string()
+}
+
+#[test]
+fn a_playback_longer_than_the_idle_window_does_not_stop_the_stream() {
+    let config: Config = toml::from_str("backend = \"agent\"").unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let aplay = slow_aplay(dir.path(), 11);
+    let (_media_dir, media) = fake_mediad();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (_frames_tx, frames_rx) = sync_channel::<Vec<i16>>(8);
+    std::thread::scope(|scope| {
+        let config_ref = &config;
+        let satellite = scope.spawn(move || {
+            let (ws, _) = tungstenite::connect(format!("ws://127.0.0.1:{port}")).expect("connect");
+            let mut detector = wake::from_config(&config_ref.wake).unwrap();
+            let mut player = Player::with_program("ignored", &aplay);
+            let mut robot = Robot::detached();
+            robot.camera = media;
+            run_session(ws, &mut Deps { config: config_ref, frames: &frames_rx, detector: detector.as_mut(),
+                                        player: &mut player, robot: &mut robot })
+        });
+        let (stream, _) = listener.accept().unwrap();
+        stream.set_read_timeout(Some(std::time::Duration::from_millis(200))).unwrap();
+        let mut bridge = tungstenite::accept(stream).unwrap();
+        bridge.send(Message::text(json!({"type": "session.ready", "version": 1}).to_string())).unwrap();
+        bridge.send(Message::text(json!({"type": "tool.call", "id": "s1", "name": "robot.stream",
+                                         "args": {"on": true}}).to_string())).unwrap();
+        bridge.send(Message::text(json!({"type": "tts.start", "rate": 22050, "channels": 1,
+                                         "format": "s16le"}).to_string())).unwrap();
+        bridge.send(Message::binary(vec![0u8; 4410])).unwrap();
+        bridge.send(Message::text(json!({"type": "tts.end"}).to_string())).unwrap();
+        // The speaker drains for 11 s; then the agent is quiet (waiting for the user).
+        let sent = std::time::Instant::now();
+        let mut after_drain = 0;
+        while sent.elapsed() < std::time::Duration::from_millis(13_500) {
+            match bridge.read() {
+                Ok(Message::Binary(bytes)) if is_jpeg(&bytes) => {
+                    if sent.elapsed() > std::time::Duration::from_secs(12) { after_drain += 1 }
+                }
+                Ok(_) => {}
+                Err(tungstenite::Error::Io(e)) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => {}
+                Err(e) => panic!("{e}"),
+            }
+        }
+        assert!(after_drain >= 5, "the stream stopped after a long playback ({after_drain} frames)");
         bridge.close(None).unwrap();
         let _ = bridge.read();
         satellite.join().unwrap().unwrap();
