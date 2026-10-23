@@ -6,6 +6,8 @@
 use std::collections::VecDeque;
 use std::net::TcpStream;
 use std::sync::mpsc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use quacksat_core::announce::Lang;
@@ -52,7 +54,43 @@ const SAY_TIMEOUT: Duration = Duration::from_secs(15);
 
 type Ws = WebSocket<MaybeTlsStream<TcpStream>>;
 
-pub fn run_session(mut ws: Ws, deps: &mut Deps) -> anyhow::Result<()> {
+/// The socket, shared with the camera stream's thread (Duck remote): the
+/// loop reads and writes through it, the stream thread writes its JPEGs.
+/// The loop blocks for whole tool calls (a walk pumps for its duration) and
+/// for `tts.end`, so frames cannot wait for the loop to send them.
+type Shared = Arc<Socket>;
+
+struct Socket {
+    ws: Mutex<Ws>,
+    /// Senders waiting for the lock. The loop holds it through each poll
+    /// and takes it again at once, and std's mutex is not fair: without
+    /// this the camera thread would starve (about one frame a second).
+    waiting: AtomicUsize,
+}
+
+fn lock(ws: &Shared) -> std::sync::MutexGuard<'_, Ws> {
+    ws.ws.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Before the loop's next poll: let a waiting sender have the lock first.
+fn give_way(ws: &Shared) {
+    while ws.waiting.load(Ordering::SeqCst) > 0 {
+        std::thread::yield_now();
+    }
+}
+
+/// What `robot.stream` sends its frames through: one binary message each.
+fn frame_sink(ws: &Shared) -> quacksat_core::stream::Sink {
+    let ws = Arc::clone(ws);
+    Arc::new(move |jpeg: &[u8]| {
+        ws.waiting.fetch_add(1, Ordering::SeqCst);
+        let mut guard = lock(&ws);
+        ws.waiting.fetch_sub(1, Ordering::SeqCst);
+        guard.send(Message::binary(jpeg.to_vec())).is_ok()
+    })
+}
+
+pub fn run_session(ws: Ws, deps: &mut Deps) -> anyhow::Result<()> {
     // Short socket timeouts turn the blocking read into a poll so mic
     // frames can be serviced in between.
     if let MaybeTlsStream::Plain(tcp) = ws.get_ref() {
@@ -60,16 +98,23 @@ pub fn run_session(mut ws: Ws, deps: &mut Deps) -> anyhow::Result<()> {
         tcp.set_write_timeout(Some(Duration::from_secs(5)))?;
     } else if let MaybeTlsStream::Rustls(tls) = ws.get_ref() {
         tls.get_ref().set_read_timeout(Some(POLL))?;
-        tls.get_ref()
-            .set_write_timeout(Some(Duration::from_secs(5)))?;
+        tls.get_ref().set_write_timeout(Some(Duration::from_secs(5)))?;
     }
+    let ws: Shared = Arc::new(Socket { ws: Mutex::new(ws), waiting: AtomicUsize::new(0) });
+    deps.robot.frame_sink = Some(frame_sink(&ws));
+    let result = session_loop(&ws, deps);
+    deps.robot.stream.stop();
+    deps.robot.frame_sink = None;
+    result
+}
 
+fn session_loop(ws: &Shared, deps: &mut Deps) -> anyhow::Result<()> {
     // The catalog announced here is the robot's own skill list, so the
     // lane gets its attempt to come back before it is read: a bridge
     // reconnect is the natural moment to notice robotd is up again.
     deps.robot.redial();
     send_json(
-        &mut ws,
+        ws,
         &json!({
             "type": "session.start",
             "version": 1,
@@ -94,10 +139,17 @@ pub fn run_session(mut ws: Ws, deps: &mut Deps) -> anyhow::Result<()> {
     let mut saying: Option<(String, Instant)> = None;
     let mut says_sent: u64 = 0;
 
+    let mut last_heard = Instant::now();
+
     loop {
         // 1. Socket first, so listen.stop / tool calls beat mic frames.
-        match ws.read() {
+        // The guard is dropped at the `;`, and a waiting camera thread goes
+        // first: its frames are sent between polls.
+        give_way(ws);
+        let read = lock(ws).read();
+        match read {
             Ok(Message::Text(text)) => {
+                last_heard = Instant::now();
                 let event: Value = match serde_json::from_str(&text) {
                     Ok(event) => event,
                     Err(e) => {
@@ -178,7 +230,7 @@ pub fn run_session(mut ws: Ws, deps: &mut Deps) -> anyhow::Result<()> {
                                 json!({"type": "tool.result", "id": id, "ok": false, "error": error})
                             }
                         };
-                        send_json(&mut ws, &reply)?;
+                        send_json(ws, &reply)?;
                         // robot.head / robot.look posed the head on
                         // purpose; any other tool leaves it free, so
                         // thinking may resume.
@@ -189,7 +241,7 @@ pub fn run_session(mut ws: Ws, deps: &mut Deps) -> anyhow::Result<()> {
                     "ping" => {
                         let mut pong = event.clone();
                         pong["type"] = json!("pong");
-                        send_json(&mut ws, &pong)?;
+                        send_json(ws, &pong)?;
                     }
                     "error" => {
                         let message = event.get("message").and_then(Value::as_str).unwrap_or("");
@@ -212,16 +264,29 @@ pub fn run_session(mut ws: Ws, deps: &mut Deps) -> anyhow::Result<()> {
             }
             // TTS audio; anything binary outside a clip is dropped.
             Ok(Message::Binary(bytes)) => {
+                last_heard = Instant::now();
                 if playing_tts {
                     deps.player.write_stream(&bytes);
                 }
                 continue;
             }
             Ok(Message::Close(_)) => return Ok(()),
-            Ok(_) => continue, // WS-level ping/pong, handled by tungstenite
+            Ok(_) => {
+                // WS-level ping/pong, handled by tungstenite
+                last_heard = Instant::now();
+                continue;
+            }
             Err(tungstenite::Error::Io(e))
                 if e.kind() == std::io::ErrorKind::WouldBlock
-                    || e.kind() == std::io::ErrorKind::TimedOut => {}
+                    || e.kind() == std::io::ErrorKind::TimedOut =>
+            {
+                // Checked only while polling: after a long tts.end or walk the
+                // queued messages are read first, so blocked time never counts.
+                if last_heard.elapsed() > quacksat_core::stream::IDLE && deps.robot.stream.is_on() {
+                    tracing::info!("camera stream: nothing from the agent for 10 s — stopped");
+                    deps.robot.stream.stop();
+                }
+            }
             Err(tungstenite::Error::ConnectionClosed | tungstenite::Error::AlreadyClosed) => {
                 return Ok(());
             }
@@ -258,7 +323,7 @@ pub fn run_session(mut ws: Ws, deps: &mut Deps) -> anyhow::Result<()> {
                 says_sent += 1;
                 let id = format!("say-{says_sent}");
                 tracing::info!(id, text, "announcing");
-                send_json(&mut ws, &json!({"type": "say", "id": id, "text": text, "lang": lang.code()}))?;
+                send_json(ws, &json!({"type": "say", "id": id, "text": text, "lang": lang.code()}))?;
                 saying = Some((id, Instant::now()));
             } else {
                 tracing::info!(text, "not said: the bridge does not speak `say` (no such feature in session.ready)");
@@ -291,14 +356,14 @@ pub fn run_session(mut ws: Ws, deps: &mut Deps) -> anyhow::Result<()> {
                         }
                         let score = deps.detector.last_score();
                         send_json(
-                            &mut ws,
+                            ws,
                             &json!({"type": "wake", "model": model, "score": score}),
                         )?;
                         enter_streaming(&mut mic, &mut listening);
                         for buffered in preroll.drain(..) {
-                            send_audio(&mut ws, &buffered)?;
+                            send_audio(ws, &buffered)?;
                         }
-                        send_audio(&mut ws, &frame)?;
+                        send_audio(ws, &frame)?;
                     } else {
                         if preroll.len() == PREROLL_FRAMES {
                             preroll.pop_front();
@@ -316,11 +381,11 @@ pub fn run_session(mut ws: Ws, deps: &mut Deps) -> anyhow::Result<()> {
                         listening.deafen();
                         continue;
                     }
-                    send_audio(&mut ws, &frame)?;
+                    send_audio(ws, &frame)?;
                     match listening.feed(&frame) {
                         Listened::Open => {}
                         Listened::Done => {
-                            send_json(&mut ws, &json!({"type": "utterance.end"}))?;
+                            send_json(ws, &json!({"type": "utterance.end"}))?;
                             stop_streaming(&mut mic, deps);
                             pose.begin();
                         }
@@ -329,7 +394,7 @@ pub fn run_session(mut ws: Ws, deps: &mut Deps) -> anyhow::Result<()> {
                                 frames = listening.frames(),
                                 "utterance timeout"
                             );
-                            send_json(&mut ws, &json!({"type": "utterance.end"}))?;
+                            send_json(ws, &json!({"type": "utterance.end"}))?;
                             stop_streaming(&mut mic, deps);
                             // A silent turn gets no answer: expecting one
                             // would end in a spurious sad tock.
@@ -401,14 +466,14 @@ fn sad_ack(deps: &mut Deps) {
     }
 }
 
-fn send_json(ws: &mut Ws, event: &Value) -> anyhow::Result<()> {
-    ws.send(Message::text(event.to_string()))?;
+fn send_json(ws: &Shared, event: &Value) -> anyhow::Result<()> {
+    lock(ws).send(Message::text(event.to_string()))?;
     Ok(())
 }
 
-fn send_audio(ws: &mut Ws, frame: &[i16]) -> anyhow::Result<()> {
+fn send_audio(ws: &Shared, frame: &[i16]) -> anyhow::Result<()> {
     debug_assert!(frame.len() <= FRAME_SAMPLES);
     let bytes: Vec<u8> = frame.iter().flat_map(|s| s.to_le_bytes()).collect();
-    ws.send(Message::binary(bytes))?;
+    lock(ws).send(Message::binary(bytes))?;
     Ok(())
 }

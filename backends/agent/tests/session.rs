@@ -431,3 +431,168 @@ fn the_ducks_own_sentence_goes_to_a_bridge_that_says() {
         });
     }
 }
+
+/// A fake mediad on a temp socket serving a 64x36 frame per connection.
+fn fake_mediad() -> (tempfile::TempDir, String) {
+    use std::io::{BufRead, BufReader, Write};
+    use std::os::unix::net::UnixListener;
+    let (width, height) = (64u32, 36u32);
+    let mut pixels = Vec::new();
+    for _y in 0..height {
+        for x in (0..width).step_by(2) {
+            let luma = (16 + (x * 219) / width) as u8;
+            pixels.extend_from_slice(&[128, luma, 128, luma]);
+        }
+    }
+    let header = json!({"width": width, "height": height, "format": "UYVY", "bytes": pixels.len(),
+                        "captured_at_unix_us": 1, "rotate": 0});
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("media.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(stream) = stream else { break };
+            let mut line = String::new();
+            if BufReader::new(stream.try_clone().unwrap()).read_line(&mut line).is_err() {
+                continue;
+            }
+            let mut out = serde_json::to_vec(&json!({"jsonrpc": "2.0", "id": 1, "result": header})).unwrap();
+            out.push(b'\n');
+            let mut writer = stream;
+            let _ = writer.write_all(&out);
+            let _ = writer.write_all(&pixels);
+        }
+    });
+    (dir, socket.to_str().unwrap().to_string())
+}
+
+fn is_jpeg(bytes: &[u8]) -> bool {
+    bytes.starts_with(&[0xFF, 0xD8, 0xFF]) && bytes.ends_with(&[0xFF, 0xD9])
+}
+
+#[test]
+fn streaming_sends_jpegs_and_a_wake_turn_still_works() {
+    let config: Config = toml::from_str("backend = \"agent\"").unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let aplay = fake_aplay(dir.path());
+    let (_media_dir, media) = fake_mediad();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (frames_tx, frames_rx) = sync_channel::<Vec<i16>>(256);
+
+    std::thread::scope(|scope| {
+        let config_ref = &config;
+        let satellite = scope.spawn(move || {
+            let (ws, _) = tungstenite::connect(format!("ws://127.0.0.1:{port}")).expect("connect");
+            let mut detector = wake::from_config(&config_ref.wake).unwrap();
+            let mut player = Player::with_program("ignored", &aplay);
+            let mut robot = Robot::detached();
+            robot.camera = media;
+            run_session(ws, &mut Deps { config: config_ref, frames: &frames_rx, detector: detector.as_mut(),
+                                        player: &mut player, robot: &mut robot })
+        });
+        let (stream, _) = listener.accept().unwrap();
+        let mut bridge = tungstenite::accept(stream).unwrap();
+        let next_text = |bridge: &mut tungstenite::WebSocket<std::net::TcpStream>| -> Value {
+            loop {
+                match bridge.read().unwrap() {
+                    Message::Text(text) => return serde_json::from_str(&text).unwrap(),
+                    Message::Binary(_) => continue,
+                    other => panic!("unexpected message: {other:?}"),
+                }
+            }
+        };
+        let start = next_text(&mut bridge);
+        let names: Vec<&str> = start["tools"].as_array().unwrap().iter().map(|t| t["name"].as_str().unwrap()).collect();
+        assert!(names.contains(&"robot.stream"));
+        bridge.send(Message::text(json!({"type": "session.ready", "version": 1}).to_string())).unwrap();
+        bridge.send(Message::text(json!({"type": "tool.call", "id": "s1", "name": "robot.stream",
+                                         "args": {"on": true, "fps": 8}}).to_string())).unwrap();
+        let result = next_text(&mut bridge);
+        assert_eq!(result["id"], "s1");
+        assert_eq!(result["data"], json!({"on": true, "fps": 8, "width": 320}));
+
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        let mut jpegs = 0;
+        while std::time::Instant::now() < until {
+            if let Message::Binary(bytes) = bridge.read().unwrap() {
+                assert!(is_jpeg(&bytes), "only video is binary before a wake");
+                jpegs += 1;
+            }
+        }
+        assert!(jpegs >= 5, "{jpegs}");
+
+        // A wake turn while streaming: mic frames and JPEGs interleave, the turn still closes.
+        for _ in 0..2 { frames_tx.send(quiet_frame()).unwrap(); }
+        for _ in 0..2 { frames_tx.send(loud_frame()).unwrap(); }
+        assert_eq!(next_text(&mut bridge)["type"], "wake");
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        for _ in 0..9 { frames_tx.send(loud_frame()).unwrap(); }
+        for _ in 0..MIN_LISTEN_FRAMES + 10 { frames_tx.send(quiet_frame()).unwrap(); }
+        let (mut audio, mut video) = (0, 0);
+        loop {
+            match bridge.read().unwrap() {
+                Message::Binary(bytes) if is_jpeg(&bytes) => video += 1,
+                Message::Binary(bytes) => { assert_eq!(bytes.len(), FRAME_SAMPLES * 2); audio += 1; }
+                Message::Text(text) => {
+                    let event: Value = serde_json::from_str(&text).unwrap();
+                    assert_eq!(event["type"], "utterance.end");
+                    break;
+                }
+                other => panic!("unexpected message: {other:?}"),
+            }
+        }
+        assert!(audio >= 12, "pre-roll + speech must be streamed ({audio})");
+        assert!(video >= 1, "video keeps flowing during the turn");
+        bridge.close(None).unwrap();
+        let _ = bridge.read();
+        satellite.join().unwrap().unwrap();
+    });
+}
+
+#[test]
+fn the_stream_stops_after_ten_quiet_seconds() {
+    let config: Config = toml::from_str("backend = \"agent\"").unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let aplay = fake_aplay(dir.path());
+    let (_media_dir, media) = fake_mediad();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (_frames_tx, frames_rx) = sync_channel::<Vec<i16>>(8);
+    std::thread::scope(|scope| {
+        let config_ref = &config;
+        let satellite = scope.spawn(move || {
+            let (ws, _) = tungstenite::connect(format!("ws://127.0.0.1:{port}")).expect("connect");
+            let mut detector = wake::from_config(&config_ref.wake).unwrap();
+            let mut player = Player::with_program("ignored", &aplay);
+            let mut robot = Robot::detached();
+            robot.camera = media;
+            run_session(ws, &mut Deps { config: config_ref, frames: &frames_rx, detector: detector.as_mut(),
+                                        player: &mut player, robot: &mut robot })
+        });
+        let (stream, _) = listener.accept().unwrap();
+        stream.set_read_timeout(Some(std::time::Duration::from_millis(200))).unwrap();
+        let mut bridge = tungstenite::accept(stream).unwrap();
+        bridge.send(Message::text(json!({"type": "session.ready", "version": 1}).to_string())).unwrap();
+        bridge.send(Message::text(json!({"type": "tool.call", "id": "s1", "name": "robot.stream",
+                                         "args": {"on": true}}).to_string())).unwrap();
+        let started = std::time::Instant::now();
+        let (mut early, mut late) = (0, 0);
+        while started.elapsed() < std::time::Duration::from_millis(11_500) {
+            match bridge.read() {
+                Ok(Message::Binary(bytes)) if is_jpeg(&bytes) => {
+                    if started.elapsed() < std::time::Duration::from_secs(9) { early += 1 }
+                    else if started.elapsed() > std::time::Duration::from_millis(10_700) { late += 1 }
+                }
+                Ok(_) => {}
+                Err(tungstenite::Error::Io(e)) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => {}
+                Err(e) => panic!("{e}"),
+            }
+        }
+        assert!(early > 20, "{early}");
+        assert_eq!(late, 0, "frames still came 10 s after the agent went quiet");
+        bridge.close(None).unwrap();
+        let _ = bridge.read();
+        satellite.join().unwrap().unwrap();
+    });
+}

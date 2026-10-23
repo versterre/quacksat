@@ -239,6 +239,15 @@ pub fn encode(
     header: &proto::MediaFrameHeader,
     pixels: &[u8],
 ) -> Result<(Vec<u8>, usize, usize), CameraError> {
+    encode_longest(header, pixels, LONGEST)
+}
+
+/// [`encode`] with another longest side (`robot.stream`'s width).
+pub fn encode_longest(
+    header: &proto::MediaFrameHeader,
+    pixels: &[u8],
+    longest: usize,
+) -> Result<(Vec<u8>, usize, usize), CameraError> {
     if !header.valid_uyvy() || pixels.len() != header.bytes {
         return Err(other("bad frame"));
     }
@@ -248,7 +257,7 @@ pub fn encode(
         pixels,
         header.width as usize,
         header.height as usize,
-        LONGEST,
+        longest,
         turn,
         &mut rgb,
     );
@@ -263,30 +272,55 @@ pub fn encode(
     Ok((jpeg, width, height))
 }
 
+/// The longest side that makes the upright frame `width` pixels wide
+/// (never wider than the frame itself: no upscaling).
+pub fn longest_for_width(header: &proto::MediaFrameHeader, width: usize) -> usize {
+    let (w, h) = (header.width as usize, header.height as usize);
+    let (upright_w, upright_h) = if header.rotate % 180 == 90 { (h, w) } else { (w, h) };
+    if upright_w == 0 {
+        return width;
+    }
+    let width = width.min(upright_w);
+    (width * upright_w.max(upright_h) + upright_w / 2) / upright_w
+}
+
+/// One upright JPEG `width` pixels wide, for `robot.stream` (same request,
+/// path and encoder as [`grab`]); `(jpeg, width, height)`.
+pub fn grab_jpeg(socket: &str, width: usize) -> Result<(Vec<u8>, usize, usize), CameraError> {
+    if socket.trim().is_empty() {
+        return Err(CameraError::Unsupported);
+    }
+    let (header, pixels) = fetch(socket, Instant::now() + DEADLINE)?;
+    encode_longest(&header, &pixels, longest_for_width(&header, width))
+}
+
+/// A synthetic UYVY frame (tests): a horizontal luma ramp, neutral chroma.
+#[cfg(test)]
+pub(crate) fn test_frame(width: u32, height: u32, rotate: u32) -> (proto::MediaFrameHeader, Vec<u8>) {
+    let mut data = Vec::with_capacity((width * height * 2) as usize);
+    for _y in 0..height {
+        for x in (0..width).step_by(2) {
+            let luma = (16 + (x * 219) / width) as u8;
+            data.extend_from_slice(&[128, luma, 128, luma]);
+        }
+    }
+    let header = proto::MediaFrameHeader {
+        width,
+        height,
+        format: "UYVY".to_string(),
+        bytes: data.len(),
+        captured_at_unix_us: 1,
+        rotate,
+    };
+    (header, data)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::os::unix::net::UnixListener;
 
-    /// A synthetic UYVY frame: a horizontal luma ramp, neutral chroma.
-    fn frame(width: u32, height: u32, rotate: u32) -> (proto::MediaFrameHeader, Vec<u8>) {
-        let mut data = Vec::with_capacity((width * height * 2) as usize);
-        for _y in 0..height {
-            for x in (0..width).step_by(2) {
-                let luma = (16 + (x * 219) / width) as u8;
-                data.extend_from_slice(&[128, luma, 128, luma]);
-            }
-        }
-        let header = proto::MediaFrameHeader {
-            width,
-            height,
-            format: "UYVY".to_string(),
-            bytes: data.len(),
-            captured_at_unix_us: 1,
-            rotate,
-        };
-        (header, data)
-    }
+    use super::test_frame as frame;
 
     /// The size a baseline JPEG declares in its SOF0 segment.
     fn sof_size(jpeg: &[u8]) -> (usize, usize) {
@@ -320,6 +354,20 @@ mod tests {
         let (header, data) = frame(1280, 720, 90);
         let (_, width, height) = encode(&header, &data).unwrap();
         assert_eq!((width, height), (360, 640));
+    }
+
+    #[test]
+    fn a_stream_frame_is_as_wide_as_asked_and_keeps_the_aspect() {
+        // The robot's sensor: 1280x720 mounted a quarter turn off -> upright 720x1280.
+        let (header, data) = frame(1280, 720, 90);
+        assert_eq!(longest_for_width(&header, 320), 569);
+        let (jpeg, width, height) = encode_longest(&header, &data, longest_for_width(&header, 320)).unwrap();
+        assert!((width as i64 - 320).abs() <= 1, "{width}");
+        assert_eq!(height, 569);
+        assert_eq!(&jpeg[..3], &[0xFF, 0xD8, 0xFF]);
+        // Wider than the frame: never upscaled.
+        let (header, _) = frame(64, 36, 0);
+        assert_eq!(longest_for_width(&header, 640), 64);
     }
 
     #[test]

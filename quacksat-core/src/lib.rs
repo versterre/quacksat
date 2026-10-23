@@ -17,6 +17,7 @@ pub mod install;
 pub mod listen;
 pub mod nav_client;
 pub mod playback;
+pub mod stream;
 pub mod robotd;
 pub mod thinking;
 pub mod tools;

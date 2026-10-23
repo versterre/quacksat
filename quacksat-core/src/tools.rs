@@ -102,6 +102,11 @@ pub struct Robot {
     /// When this satellite last changed robotd's skill table: the only
     /// homing worth waiting for before the next change (see [`settled`]).
     pub last_change: Option<std::time::Instant>,
+    /// `robot.stream`'s camera thread (Duck remote).
+    pub stream: crate::stream::Stream,
+    /// Where streamed frames go: set by a backend that can send binary
+    /// frames on its socket (agent), for the length of one session.
+    pub frame_sink: Option<crate::stream::Sink>,
 }
 
 impl Robot {
@@ -121,6 +126,8 @@ impl Robot {
             install_dir: config.install.dir.clone().into(),
             pending_install: None,
             last_change: None,
+            stream: crate::stream::Stream::default(),
+            frame_sink: None,
         }
     }
 
@@ -150,6 +157,8 @@ impl Robot {
             install_dir: crate::install::DEFAULT_DIR.into(),
             pending_install: None,
             last_change: None,
+            stream: crate::stream::Stream::default(),
+            frame_sink: None,
         }
     }
 }
@@ -256,6 +265,21 @@ pub fn catalog(robot: &Robot) -> Value {
         "parameters": {"type": "object", "properties": {}}
     }));
     tools.push(json!({
+        "name": "robot.stream",
+        "description": "Start or stop the head camera's live stream to the agent (binary JPEG \
+    frames on this socket, for a remote screen). Not for answering what the duck sees: use \
+    robot.get_frame for one picture.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "on": {"type": "boolean"},
+                "fps": {"type": "integer", "minimum": crate::stream::MIN_FPS, "maximum": crate::stream::MAX_FPS, "description": "frames a second, default 8"},
+                "width": {"type": "integer", "minimum": crate::stream::MIN_WIDTH, "maximum": crate::stream::MAX_WIDTH, "description": "pixels wide, default 320; the height keeps the aspect"}
+            },
+            "required": ["on"]
+        }
+    }));
+    tools.push(json!({
         "name": "robot.install_policy",
         "description": "Install a policy from the Hugging Face Hub (source org/repo) or an \
     https URL as a new user skill named `name`; the duck then homes (moves its joints) for \
@@ -320,7 +344,13 @@ pub fn execute(name: &str, args: &Value, robot: &mut Robot) -> Result<Value, Str
     }
     // The camera is mediad's, not robotd's: a frame does not wait on
     // (or redial) the robot's lane.
+    if name == "robot.stream" {
+        return stream_tool(args, robot);
+    }
     if name == "robot.get_frame" {
+        if let Some(frame) = robot.stream.latest() {
+            return Ok(frame);
+        }
         return crate::camera::grab(&robot.camera).map_err(|error| error.to_string());
     }
     match name {
@@ -430,6 +460,43 @@ pub fn execute(name: &str, args: &Value, robot: &mut Robot) -> Result<Value, Str
 
 /// `robot.install_policy`: check, download, `robot.setSkill`. Every
 /// refusal is one of [`crate::install`]'s fixed lines.
+/// `robot.stream {on, fps?, width?}` (Duck remote). Refusals are one line, no paths.
+fn stream_tool(args: &Value, robot: &mut Robot) -> Result<Value, String> {
+    use crate::stream::{DEFAULT_FPS, DEFAULT_WIDTH, MAX_FPS, MAX_WIDTH, MIN_FPS, MIN_WIDTH};
+    let on = args
+        .get("on")
+        .and_then(Value::as_bool)
+        .ok_or_else(|| "stream: on is required".to_string())?;
+    if !on {
+        robot.stream.stop();
+        let (fps, width) = robot.stream.params();
+        return Ok(json!({"on": false, "fps": fps, "width": width}));
+    }
+    if robot.stream.take_camera_failure() {
+        return Err("stream: camera failed".to_string());
+    }
+    if robot.camera.trim().is_empty() {
+        return Err("stream: no camera".to_string());
+    }
+    let pick = |key: &str, default: u64, lo: u64, hi: u64, error: &str| -> Result<u64, String> {
+        match args.get(key) {
+            None | Some(Value::Null) => Ok(default),
+            Some(value) => value
+                .as_u64()
+                .filter(|n| (lo..=hi).contains(n))
+                .ok_or_else(|| error.to_string()),
+        }
+    };
+    let fps = pick("fps", DEFAULT_FPS, MIN_FPS, MAX_FPS, "stream: bad fps")?;
+    let width = pick("width", DEFAULT_WIDTH, MIN_WIDTH, MAX_WIDTH, "stream: bad width")?;
+    let Some(sink) = robot.frame_sink.clone() else {
+        return Err("stream: not on this backend".to_string());
+    };
+    let socket = robot.camera.clone();
+    robot.stream.start(&socket, fps, width, sink);
+    Ok(json!({"on": true, "fps": fps, "width": width}))
+}
+
 fn install_policy(args: &Value, robot: &mut Robot) -> Result<Value, String> {
     let request = crate::install::Request::parse(args).map_err(str::to_string)?;
     install_with(request, robot, crate::install::fetch_to)
@@ -1101,6 +1168,7 @@ mod tests {
                 "robot.move",
                 "robot.state",
                 "robot.get_frame",
+                "robot.stream",
                 "robot.install_policy",
                 "robot.policy_status",
                 "robot.remove_policy",
@@ -1113,5 +1181,69 @@ mod tests {
         }
         assert!(execute("robot.go_to", &json!({}), &mut robot).unwrap_err().starts_with("unknown tool"));
 
+    }
+
+    #[test]
+    fn stream_refusals_are_one_line_and_need_no_camera_thread() {
+        let mut robot = Robot::detached();
+        assert_eq!(execute("robot.stream", &json!({"on": true}), &mut robot), Err("stream: no camera".to_string()));
+        assert_eq!(execute("robot.stream", &json!({}), &mut robot), Err("stream: on is required".to_string()));
+        robot.camera = "/run/mediad/media.sock".to_string();
+        for (args, error) in [
+            (json!({"on": true, "fps": 0}), "stream: bad fps"),
+            (json!({"on": true, "fps": 11}), "stream: bad fps"),
+            (json!({"on": true, "fps": 2.5}), "stream: bad fps"),
+            (json!({"on": true, "fps": "8"}), "stream: bad fps"),
+            (json!({"on": true, "width": 100}), "stream: bad width"),
+            (json!({"on": true, "width": 700}), "stream: bad width"),
+            (json!({"on": true}), "stream: not on this backend"),
+        ] {
+            assert_eq!(execute("robot.stream", &args, &mut robot), Err(error.to_string()), "{args}");
+        }
+        assert_eq!(
+            execute("robot.stream", &json!({"on": false}), &mut robot).unwrap(),
+            json!({"on": false, "fps": 0, "width": 0})
+        );
+    }
+
+    #[test]
+    fn stream_on_off_and_get_frame_takes_the_latest_frame() {
+        let (_dir, socket) = crate::stream::testing::serving_mediad(64, 36);
+        let mut robot = Robot::detached();
+        robot.camera = socket;
+        robot.frame_sink = Some(std::sync::Arc::new(|_: &[u8]| true));
+        assert_eq!(
+            execute("robot.stream", &json!({"on": true}), &mut robot).unwrap(),
+            json!({"on": true, "fps": 8, "width": 320})
+        );
+        std::thread::sleep(std::time::Duration::from_millis(400));
+        let frame = execute("robot.get_frame", &json!({}), &mut robot).unwrap();
+        assert_eq!(frame, robot.stream.latest().unwrap());
+        assert_eq!(
+            execute("robot.stream", &json!({"on": true, "fps": 4, "width": 160}), &mut robot).unwrap(),
+            json!({"on": true, "fps": 4, "width": 160})
+        );
+        assert_eq!(
+            execute("robot.stream", &json!({"on": false}), &mut robot).unwrap(),
+            json!({"on": false, "fps": 4, "width": 160})
+        );
+        assert!(robot.stream.latest().is_none());
+    }
+
+    #[test]
+    fn a_camera_that_failed_three_times_is_reported_on_the_next_start() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut robot = Robot::detached();
+        robot.camera = dir.path().join("gone.sock").to_str().unwrap().to_string();
+        robot.frame_sink = Some(std::sync::Arc::new(|_: &[u8]| true));
+        execute("robot.stream", &json!({"on": true, "fps": 10}), &mut robot).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(800));
+        assert_eq!(
+            execute("robot.stream", &json!({"on": true}), &mut robot),
+            Err("stream: camera failed".to_string())
+        );
+        // Reported once: the next start tries again.
+        assert!(execute("robot.stream", &json!({"on": true}), &mut robot).is_ok());
+        robot.stream.stop();
     }
 }
