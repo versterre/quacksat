@@ -62,6 +62,9 @@ type Shared = Arc<Socket>;
 
 struct Socket {
     ws: Mutex<Ws>,
+    /// After a frame's write timed out (a stalled uplink): no frame tries
+    /// the socket again before this.
+    frames_paused_until: Mutex<Option<Instant>>,
     /// Senders waiting for the lock. The loop holds it through each poll
     /// and takes it again at once, and std's mutex is not fair: without
     /// this the camera thread would starve (about one frame a second).
@@ -82,17 +85,71 @@ fn give_way(ws: &Shared) {
     }
 }
 
+/// The loop's own writes (replies, mic audio) wait this long on a full
+/// uplink before the session gives up.
+const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
+/// A video frame's socket writes get far less: on a stalled uplink each
+/// one gives up after this, so a frame holds the socket (and with it the
+/// loop -- mic frames, tool calls, a Stop's zero) for a few hundred ms at
+/// most (a write still making progress may be followed by one more), not
+/// `WRITE_TIMEOUT`.
+const FRAME_WRITE_TIMEOUT: Duration = Duration::from_millis(200);
+/// After a frame write timed out, frames are dropped for this long. The
+/// part already written stays queued in tungstenite and goes out ahead of
+/// the next write, so the stream is never cut mid-message.
+const FRAME_PAUSE: Duration = Duration::from_secs(1);
+
+fn set_write_timeout(ws: &Ws, timeout: Duration) -> std::io::Result<()> {
+    match ws.get_ref() {
+        MaybeTlsStream::Plain(tcp) => tcp.set_write_timeout(Some(timeout)),
+        MaybeTlsStream::Rustls(tls) => tls.get_ref().set_write_timeout(Some(timeout)),
+        _ => Ok(()),
+    }
+}
+
+fn write_timed_out(error: &tungstenite::Error) -> bool {
+    matches!(error, tungstenite::Error::Io(e)
+        if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut))
+}
+
 /// What `robot.stream` sends its frames through: one binary message each.
+/// False only when the connection is gone; a frame that couldn't be
+/// written in `FRAME_WRITE_TIMEOUT` pauses the frames for `FRAME_PAUSE`.
 fn frame_sink(ws: &Shared) -> quacksat_core::stream::Sink {
     let ws = Arc::clone(ws);
     Arc::new(move |jpeg: &[u8]| {
         if ws.closed.load(Ordering::SeqCst) {
             return false;
         }
+        let paused = |until: Option<Instant>| until.is_some_and(|t| Instant::now() < t);
+        if paused(*ws.frames_paused_until.lock().unwrap_or_else(|p| p.into_inner())) {
+            return true;
+        }
         ws.waiting.fetch_add(1, Ordering::SeqCst);
         let mut guard = lock(&ws);
         ws.waiting.fetch_sub(1, Ordering::SeqCst);
-        !ws.closed.load(Ordering::SeqCst) && guard.send(Message::binary(jpeg.to_vec())).is_ok()
+        if ws.closed.load(Ordering::SeqCst) {
+            return false;
+        }
+        let _ = set_write_timeout(&guard, FRAME_WRITE_TIMEOUT);
+        let result = guard.send(Message::binary(jpeg.to_vec()));
+        let _ = set_write_timeout(&guard, WRITE_TIMEOUT);
+        drop(guard);
+        let mut until = ws.frames_paused_until.lock().unwrap_or_else(|p| p.into_inner());
+        match result {
+            Ok(()) => {
+                *until = None;
+                true
+            }
+            Err(error) if write_timed_out(&error) => {
+                if until.is_none() {
+                    tracing::info!("camera stream: the uplink is stalled — frames paused");
+                }
+                *until = Some(Instant::now() + FRAME_PAUSE);
+                true
+            }
+            Err(_) => false,
+        }
     })
 }
 
@@ -101,13 +158,13 @@ pub fn run_session(ws: Ws, deps: &mut Deps) -> anyhow::Result<()> {
     // frames can be serviced in between.
     if let MaybeTlsStream::Plain(tcp) = ws.get_ref() {
         tcp.set_read_timeout(Some(POLL))?;
-        tcp.set_write_timeout(Some(Duration::from_secs(5)))?;
     } else if let MaybeTlsStream::Rustls(tls) = ws.get_ref() {
         tls.get_ref().set_read_timeout(Some(POLL))?;
-        tls.get_ref().set_write_timeout(Some(Duration::from_secs(5)))?;
     }
+    set_write_timeout(&ws, WRITE_TIMEOUT)?;
     let ws: Shared = Arc::new(Socket {
         ws: Mutex::new(ws),
+        frames_paused_until: Mutex::new(None),
         waiting: AtomicUsize::new(0),
         closed: AtomicBool::new(false),
     });
@@ -491,4 +548,69 @@ fn send_audio(ws: &Shared, frame: &[i16]) -> anyhow::Result<()> {
     let bytes: Vec<u8> = frame.iter().flat_map(|s| s.to_le_bytes()).collect();
     lock(ws).send(Message::binary(bytes))?;
     Ok(())
+}
+
+#[cfg(test)]
+mod frame_sink_tests {
+    use super::*;
+    use std::net::TcpListener;
+
+    /// A socket whose far end completes the handshake and then never reads:
+    /// the uplink stalls once the kernel's buffers are full.
+    fn stalled_socket() -> (Shared, std::thread::JoinHandle<()>, mpsc::Sender<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (done_tx, done_rx) = mpsc::channel::<()>();
+        let server = std::thread::spawn(move || {
+            let (tcp, _) = listener.accept().unwrap();
+            let _ws = tungstenite::accept(tcp).unwrap();
+            let _ = done_rx.recv();                    // holds the socket open, unread
+        });
+        let tcp = TcpStream::connect(addr).unwrap();
+        let (ws, _) = tungstenite::client(format!("ws://{addr}/"), MaybeTlsStream::Plain(tcp)).unwrap();
+        set_write_timeout(&ws, WRITE_TIMEOUT).unwrap();
+        let shared: Shared = Arc::new(Socket {
+            ws: Mutex::new(ws),
+            frames_paused_until: Mutex::new(None),
+            waiting: AtomicUsize::new(0),
+            closed: AtomicBool::new(false),
+        });
+        (shared, server, done_tx)
+    }
+
+    #[test]
+    fn a_stalled_uplink_holds_the_socket_for_one_short_frame_write_then_pauses_frames() {
+        let (ws, server, done) = stalled_socket();
+        let sink = frame_sink(&ws);
+        let frame = vec![0xAB_u8; 100 * 1024];
+        let mut slowest = Duration::ZERO;
+        let mut paused = false;
+        for _ in 0..4000 {
+            let started = Instant::now();
+            assert!(sink(&frame), "a stall is not a lost connection");
+            slowest = slowest.max(started.elapsed());
+            if ws.frames_paused_until.lock().unwrap().is_some() {
+                paused = true;
+                break;
+            }
+        }
+        assert!(paused, "the uplink never stalled");
+        // A write still making progress, then one that makes none: well under the loop's 5 s.
+        assert!(slowest < Duration::from_secs(1), "{slowest:?}");
+        // Paused: the next frame doesn't touch the socket, and the loop's lock is free.
+        let started = Instant::now();
+        assert!(sink(&frame));
+        assert!(started.elapsed() < Duration::from_millis(20));
+        assert!(ws.ws.try_lock().is_ok());
+        // The loop's own writes keep the long deadline.
+        let guard = lock(&ws);
+        if let MaybeTlsStream::Plain(tcp) = guard.get_ref() {
+            assert_eq!(tcp.write_timeout().unwrap(), Some(WRITE_TIMEOUT));
+        }
+        drop(guard);
+        ws.closed.store(true, Ordering::SeqCst);
+        assert!(!sink(&frame));
+        let _ = done.send(());
+        server.join().unwrap();
+    }
 }

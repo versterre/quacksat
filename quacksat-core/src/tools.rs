@@ -264,21 +264,25 @@ pub fn catalog(robot: &Robot) -> Value {
         "description": get_frame,
         "parameters": {"type": "object", "properties": {}}
     }));
-    tools.push(json!({
-        "name": "robot.stream",
-        "description": "Start or stop the head camera's live stream to the agent (binary JPEG \
-    frames on this socket, for a remote screen). Not for answering what the duck sees: use \
-    robot.get_frame for one picture.",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "on": {"type": "boolean"},
-                "fps": {"type": "integer", "minimum": crate::stream::MIN_FPS, "maximum": crate::stream::MAX_FPS, "description": "frames a second, default 8"},
-                "width": {"type": "integer", "minimum": crate::stream::MIN_WIDTH, "maximum": crate::stream::MAX_WIDTH, "description": "pixels wide, default 320; the height keeps the aspect"}
-            },
-            "required": ["on"]
-        }
-    }));
+    // Only a backend that can carry the frames (the agent's socket sets
+    // `frame_sink`) lists robot.stream: elsewhere it would always refuse.
+    if robot.frame_sink.is_some() {
+        tools.push(json!({
+            "name": "robot.stream",
+            "description": "Start or stop the head camera's live stream to the agent (binary JPEG \
+        frames on this socket, for a remote screen). Not for answering what the duck sees: use \
+        robot.get_frame for one picture.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "on": {"type": "boolean"},
+                    "fps": {"type": "integer", "minimum": crate::stream::MIN_FPS, "maximum": crate::stream::MAX_FPS, "description": "frames a second, default 8"},
+                    "width": {"type": "integer", "minimum": crate::stream::MIN_WIDTH, "maximum": crate::stream::MAX_WIDTH, "description": "pixels wide, default 320; the height keeps the aspect"}
+                },
+                "required": ["on"]
+            }
+        }));
+    }
     tools.push(json!({
         "name": "robot.install_policy",
         "description": "Install a policy from the Hugging Face Hub (source org/repo) or an \
@@ -1150,8 +1154,16 @@ mod tests {
     fn catalog_matches_the_executor_allowlist() {
         // Without a navigation daemon the satellite announces its own
         // tools and nothing else; with one, the daemon's catalog is
-        // spliced in (see `crate::nav_client`).
-        let catalog = catalog(&Robot::detached());
+        // spliced in (see `crate::nav_client`). robot.stream is listed
+        // only where frames can travel (a frame sink, the agent backend).
+        let names_of = |robot: &Robot| -> Vec<String> {
+            catalog(robot).as_array().unwrap().iter().map(|t| t["name"].as_str().unwrap().to_string()).collect()
+        };
+        assert!(!names_of(&Robot::detached()).iter().any(|n| n == "robot.stream"));
+        let mut streaming = Robot::detached();
+        streaming.frame_sink = Some(std::sync::Arc::new(|_: &[u8]| true));
+        assert!(names_of(&streaming).iter().any(|n| n == "robot.stream"));
+        let catalog = catalog(&streaming);
         let names: Vec<&str> = catalog
             .as_array()
             .unwrap()
